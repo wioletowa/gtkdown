@@ -93,6 +93,17 @@ pub struct Parsed {
     pub markers: Vec<Marker>,
     /// Ranges of `[ ]` / `[x]` task boxes.
     pub tasks: Vec<Range<usize>>,
+    pub links: Vec<Link>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    /// Whole element, markup included.
+    pub range: Range<usize>,
+    /// Destination as written: `Note#Heading` for wikilinks, a URL or path otherwise.
+    pub target: String,
+    pub wiki: bool,
+    pub embed: bool,
 }
 
 struct Frame<'a> {
@@ -267,7 +278,17 @@ impl Parsed {
                     self.marker_in(Some(src), c.end..r.end, r.clone());
                 }
             }
-            Tag::Link { link_type, .. } => {
+            Tag::Link { link_type, dest_url, .. } => {
+                let target = match link_type {
+                    LinkType::Email => format!("mailto:{dest_url}"),
+                    _ => dest_url.to_string(),
+                };
+                self.links.push(Link {
+                    range: r.clone(),
+                    target,
+                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                    embed: false,
+                });
                 let style = if matches!(link_type, LinkType::WikiLink { .. }) {
                     Style::WikiLink
                 } else {
@@ -282,7 +303,15 @@ impl Parsed {
                     _ => self.span(r, style),
                 }
             }
-            Tag::Image { .. } => self.span(r, Style::Embed),
+            Tag::Image { link_type, dest_url, .. } => {
+                self.links.push(Link {
+                    range: r.clone(),
+                    target: dest_url.to_string(),
+                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                    embed: true,
+                });
+                self.span(r, Style::Embed)
+            }
             Tag::CodeBlock(kind) => {
                 self.span(r.clone(), Style::CodeBlock);
                 if matches!(kind, CodeBlockKind::Fenced(_)) {
@@ -488,6 +517,21 @@ mod tests {
         assert_eq!(styles(src, Style::Link), vec!["t"]);
         assert_eq!(styles(src, Style::Embed), vec!["![[img.png]]"]);
         assert_eq!(hidden(src), vec!["[[Note|", "]]", "[[", "]]", "[", "](http://x)"]);
+    }
+
+    #[test]
+    fn link_targets() {
+        let src = "[[Note#Head|a]] [b](Other%20note.md) ![[img.png]] <x@y.z>";
+        let t: Vec<_> = parse(src).links.into_iter().map(|l| (l.target, l.wiki, l.embed)).collect();
+        assert_eq!(
+            t,
+            vec![
+                ("Note#Head".into(), true, false),
+                ("Other%20note.md".into(), false, false),
+                ("img.png".into(), true, true),
+                ("mailto:x@y.z".into(), false, false),
+            ]
+        );
     }
 
     #[test]

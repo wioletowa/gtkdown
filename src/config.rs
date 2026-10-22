@@ -159,7 +159,7 @@ pub fn obsidian_vaults() -> Vec<PathBuf> {
 }
 
 /// Minimal scan for `"key": "value"` pairs; enough for obsidian.json without a JSON crate.
-fn json_strings_for_key(text: &str, key: &str) -> Vec<String> {
+pub fn json_strings_for_key(text: &str, key: &str) -> Vec<String> {
     let needle = format!("\"{key}\"");
     let mut out = Vec::new();
     let mut rest = text;

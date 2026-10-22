@@ -51,6 +51,15 @@ pub fn tr(en: &'static str) -> &'static str {
         "Words" => "Слов",
         "Characters" => "Символов",
         "Close tab" => "Закрыть вкладку",
+        "Files" => "Файлы",
+        "Search" => "Поиск",
+        "Backlinks" => "Обратные ссылки",
+        "Search in vault…" => "Поиск по хранилищу…",
+        "Nothing found" => "Ничего не найдено",
+        "No backlinks" => "Нет обратных ссылок",
+        "Quick switcher" => "Быстрый переход",
+        "Type a note name…" => "Введите имя заметки…",
+        "Create note" => "Создать заметку",
         _ => en,
     }
 }

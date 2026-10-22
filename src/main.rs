@@ -2,8 +2,10 @@ mod config;
 mod i18n;
 mod markdown;
 mod note;
+mod panels;
 mod theme;
 mod tree;
+mod vault;
 mod window;
 
 use adw::prelude::*;

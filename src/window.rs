@@ -4,7 +4,9 @@ use crate::config::{Config, Session};
 use crate::i18n::tr;
 use crate::note::{self, Note};
 use crate::theme::{self, Styles};
+use crate::panels::{self, Results};
 use crate::tree::{self, Tree};
+use crate::vault;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
@@ -12,6 +14,13 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 const IMAGES: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif"];
+
+/// Where to put the cursor after opening a note.
+pub enum Goto {
+    None,
+    Offset(usize),
+    Heading(String),
+}
 
 enum Content {
     Empty,
@@ -49,6 +58,14 @@ pub struct App {
     tab_view: adw::TabView,
     toasts: adw::ToastOverlay,
     status: gtk::Label,
+    backlinks_button: gtk::Button,
+    side_stack: gtk::Stack,
+    search_entry: gtk::SearchEntry,
+    search_results: Rc<Results>,
+    backlinks: Rc<Results>,
+    /// Bumped per request so stale background results are dropped.
+    search_gen: Cell<u64>,
+    backlinks_gen: Cell<u64>,
     vault_button: gtk::MenuButton,
     tree: Tree,
     styles: Rc<Styles>,
@@ -90,6 +107,33 @@ impl App {
         side_header.set_title_widget(Some(&gtk::Label::new(None)));
         side_header.pack_end(&new_note);
 
+        let side_stack = gtk::Stack::new();
+        let mut group: Option<gtk::ToggleButton> = None;
+        let side_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        for (name, icon, tip) in [
+            ("files", "folder-symbolic", tr("Files")),
+            ("search", "system-search-symbolic", tr("Search")),
+            ("backlinks", "insert-link-symbolic", tr("Backlinks")),
+        ] {
+            let b = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).css_classes(["flat"]).build();
+            b.set_group(group.as_ref());
+            group.get_or_insert_with(|| b.clone());
+            let st = side_stack.clone();
+            b.connect_toggled(move |b| {
+                if b.is_active() {
+                    st.set_visible_child_name(name);
+                }
+            });
+            let b2 = b.clone();
+            side_stack.connect_visible_child_name_notify(move |st| {
+                if st.visible_child_name().as_deref() == Some(name) {
+                    b2.set_active(true);
+                }
+            });
+            side_buttons.append(&b);
+        }
+        side_header.pack_start(&side_buttons);
+
         let weak: Rc<RefCell<Weak<App>>> = Rc::new(RefCell::new(Weak::new()));
         let w = weak.clone();
         let tree = Tree::new(move |path, new_tab| {
@@ -102,6 +146,30 @@ impl App {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        side_stack.add_named(&tree_scroll, Some("files"));
+
+        let open_hit = |w: Rc<RefCell<Weak<App>>>| {
+            move |h: vault::Hit| {
+                if let Some(a) = w.borrow().upgrade() {
+                    a.open_at(h.path, false, Goto::Offset(h.offset));
+                }
+            }
+        };
+        let search_results = Results::new(open_hit(weak.clone()));
+        let search_entry = gtk::SearchEntry::builder()
+            .placeholder_text(tr("Search in vault…"))
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        let search_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        search_box.append(&search_entry);
+        search_box.append(&search_results.widget);
+        side_stack.add_named(&search_box, Some("search"));
+
+        let backlinks = Results::new(open_hit(weak.clone()));
+        side_stack.add_named(&backlinks.widget, Some("backlinks"));
 
         let vault_button = gtk::MenuButton::builder()
             .direction(gtk::ArrowType::Up)
@@ -137,7 +205,7 @@ impl App {
 
         let sidebar = adw::ToolbarView::new();
         sidebar.add_top_bar(&side_header);
-        sidebar.set_content(Some(&tree_scroll));
+        sidebar.set_content(Some(&side_stack));
         sidebar.add_bottom_bar(&side_bottom);
 
         // Content: tabs.
@@ -165,13 +233,18 @@ impl App {
             .sync_create()
             .build();
 
-        let status = gtk::Label::builder().halign(gtk::Align::End).build();
-        status.add_css_class("statusbar");
+        let status = gtk::Label::new(None);
+        let backlinks_button = gtk::Button::builder().css_classes(["flat", "statusbar"]).build();
+        let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        status_bar.set_halign(gtk::Align::End);
+        status_bar.add_css_class("statusbar");
+        status_bar.append(&backlinks_button);
+        status_bar.append(&status);
 
         let content = adw::ToolbarView::new();
         content.add_top_bar(&header);
         content.set_content(Some(&tab_view));
-        content.add_bottom_bar(&status);
+        content.add_bottom_bar(&status_bar);
         split.set_content(Some(&content));
 
         let toasts = adw::ToastOverlay::new();
@@ -210,6 +283,13 @@ impl App {
             tab_view,
             toasts,
             status,
+            backlinks_button,
+            side_stack,
+            search_entry,
+            search_results,
+            backlinks,
+            search_gen: Cell::new(0),
+            backlinks_gen: Cell::new(0),
             vault_button,
             tree,
             styles,
@@ -255,6 +335,12 @@ impl App {
         win_action("save", |s| s.save_all());
         win_action("toggle-sidebar", |s| s.split.set_show_sidebar(!s.split.shows_sidebar()));
         win_action("choose-vault", |s| s.choose_vault());
+        win_action("quick-open", |s| s.quick_open());
+        win_action("search", |s| {
+            s.show_side("search");
+            s.search_entry.grab_focus();
+        });
+        win_action("backlinks", |s| s.show_side("backlinks"));
 
         let open_vault = gio::SimpleAction::new("open-vault", Some(glib::VariantTy::STRING));
         let weak = Rc::downgrade(self);
@@ -294,9 +380,27 @@ impl App {
         app.set_accels_for_action("win.new-note", &["<Ctrl>n"]);
         app.set_accels_for_action("win.save", &["<Ctrl>s"]);
         app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+        app.set_accels_for_action("win.quick-open", &["<Ctrl>o"]);
+        app.set_accels_for_action("win.search", &["<Ctrl><Shift>f"]);
     }
 
     fn setup_signals(self: &Rc<Self>) {
+        self.backlinks_button.set_action_name(Some("win.backlinks"));
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_search_changed(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.run_search();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.side_stack.connect_visible_child_name_notify(move |st| {
+            if st.visible_child_name().as_deref() == Some("backlinks")
+                && let Some(s) = weak.upgrade()
+            {
+                s.refresh_backlinks();
+            }
+        });
+
         let weak = Rc::downgrade(self);
         self.tab_view.connect_close_page(move |tv, page| {
             if let Some(s) = weak.upgrade() {
@@ -461,6 +565,13 @@ impl App {
                     a.update_tab_title(&t);
                 }
             }));
+            let (wa, wn) = (Rc::downgrade(self), Rc::downgrade(&n));
+            *n.on_link.borrow_mut() = Some(Box::new(move |target, new_tab| {
+                if let (Some(a), Some(n)) = (wa.upgrade(), wn.upgrade()) {
+                    let from = n.path.borrow().clone();
+                    a.follow_link(&from, &target, new_tab);
+                }
+            }));
         }
         if self.tab_view.selected_page().as_ref() == Some(&tab.page) {
             self.on_tab_switched();
@@ -484,7 +595,7 @@ impl App {
         self.status.set_label(&format!("{}: {words}   {}: {chars}", tr("Words"), tr("Characters")));
     }
 
-    fn on_tab_switched(&self) {
+    fn on_tab_switched(self: &Rc<Self>) {
         let tab = self.current_tab();
         let path = tab.as_ref().and_then(|t| t.path());
         self.tree.select(path.as_deref());
@@ -496,6 +607,7 @@ impl App {
             }
             None => self.status.set_label(""),
         }
+        self.refresh_backlinks();
         let title = path.and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
         self.window.set_title(Some(&match title {
             Some(t) => format!("{t} — gtkdown"),
@@ -504,9 +616,14 @@ impl App {
     }
 
     pub fn open_file(self: &Rc<Self>, path: PathBuf, new_tab: bool) {
+        self.open_at(path, new_tab, Goto::None);
+    }
+
+    pub fn open_at(self: &Rc<Self>, path: PathBuf, new_tab: bool, goto: Goto) {
         let existing = self.tabs.borrow().iter().find(|t| t.path().as_ref() == Some(&path)).cloned();
         if let Some(t) = existing {
             self.tab_view.set_selected_page(&t.page);
+            Self::apply_goto(&t, goto);
             return;
         }
         let ext = tree::ext(&path.to_string_lossy()).unwrap_or_default();
@@ -534,13 +651,139 @@ impl App {
         };
         self.set_content(&tab, content);
         self.tab_view.set_selected_page(&tab.page);
+        Self::apply_goto(&tab, goto);
+    }
+
+    fn apply_goto(tab: &Tab, goto: Goto) {
+        let Some(n) = tab.note() else { return };
+        let offset = match goto {
+            Goto::None => return,
+            Goto::Offset(o) => Some(o),
+            Goto::Heading(h) => vault::heading_offset(&n.text(), &h),
+        };
+        if let Some(o) = offset {
+            n.goto(o);
+        }
+    }
+
+    /// Opens a link target like Obsidian: external URLs in the browser, notes by name,
+    /// missing notes are created (in the folder `.obsidian/app.json` asks for).
+    fn follow_link(self: &Rc<Self>, from: &Path, target: &str, new_tab: bool) {
+        if vault::is_external(target) {
+            gtk::UriLauncher::new(target).launch(Some(&self.window), gio::Cancellable::NONE, |_| {});
+            return;
+        }
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let (link, anchor) = vault::split_target(target);
+        let goto = anchor.map_or(Goto::None, Goto::Heading);
+        let files = vault::list_files(&root);
+        if let Some(p) = vault::resolve(&root, &files, from, &link) {
+            self.open_at(p, new_tab, goto);
+            return;
+        }
+        if link.is_empty() || link.contains("..") {
+            return;
+        }
+        let name = if link.to_lowercase().ends_with(".md") { link.clone() } else { format!("{link}.md") };
+        let path = if link.contains('/') {
+            root.join(name.trim_start_matches('/'))
+        } else {
+            vault::new_note_dir(&root, Some(from)).join(&name)
+        };
+        if tree::ext(&name).is_some_and(|e| e != "md") {
+            return;
+        }
+        let made = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, ""));
+        match made {
+            Ok(()) => self.open_at(path, new_tab, Goto::None),
+            Err(e) => self.toast(&format!("{}: {e}", tr("Cannot save file"))),
+        }
+    }
+
+    fn quick_open(self: &Rc<Self>) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let (w1, w2) = (Rc::downgrade(self), Rc::downgrade(self));
+        let from = self.current_tab().and_then(|t| t.path());
+        panels::quick_switcher(
+            &self.window,
+            root.clone(),
+            move |p, new_tab| {
+                if let Some(a) = w1.upgrade() {
+                    a.open_at(p, new_tab, Goto::None);
+                }
+            },
+            move |name, new_tab| {
+                if let Some(a) = w2.upgrade() {
+                    let from = from.clone().unwrap_or_else(|| root.join("."));
+                    a.follow_link(&from, &name, new_tab);
+                }
+            },
+        );
+    }
+
+    fn run_search(self: &Rc<Self>) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let query = self.search_entry.text().to_string();
+        let generation = self.search_gen.get() + 1;
+        self.search_gen.set(generation);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let q = query.clone();
+            let r = root.clone();
+            let hits = gio::spawn_blocking(move || vault::search(&vault::list_files(&r), &q, 500))
+                .await
+                .unwrap_or_default();
+            let Some(a) = weak.upgrade() else { return };
+            if a.search_gen.get() != generation {
+                return;
+            }
+            let empty = if query.trim().is_empty() { "" } else { tr("Nothing found") };
+            a.search_results.set(hits, &root, empty);
+        });
+    }
+
+    fn refresh_backlinks(self: &Rc<Self>) {
+        let generation = self.backlinks_gen.get() + 1;
+        self.backlinks_gen.set(generation);
+        let root = self.vault.borrow().clone();
+        let target = self.current_tab().and_then(|t| t.path());
+        let (Some(root), Some(target)) = (root, target) else {
+            self.backlinks_button.set_visible(false);
+            self.backlinks.set(Vec::new(), Path::new("/"), "");
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let (r, t) = (root.clone(), target.clone());
+            let hits = gio::spawn_blocking(move || vault::backlinks(&r, &vault::list_files(&r), &t))
+                .await
+                .unwrap_or_default();
+            let Some(a) = weak.upgrade() else { return };
+            if a.backlinks_gen.get() != generation {
+                return;
+            }
+            let files = {
+                let mut v: Vec<_> = hits.iter().map(|h| &h.path).collect();
+                v.dedup();
+                v.len()
+            };
+            a.backlinks_button.set_label(&format!("{}: {files}", tr("Backlinks")));
+            a.backlinks_button.set_visible(true);
+            a.backlinks.set(hits, &root, tr("No backlinks"));
+        });
+    }
+
+    fn show_side(&self, name: &str) {
+        self.split.set_show_sidebar(true);
+        self.side_stack.set_visible_child_name(name);
     }
 
     fn new_note(self: &Rc<Self>) {
         let Some(vault) = self.vault.borrow().clone() else { return };
         let base = tr("Untitled");
+        let dir = vault::new_note_dir(&vault, self.current_tab().and_then(|t| t.path()).as_deref());
         let path = (0..)
-            .map(|i| if i == 0 { vault.join(format!("{base}.md")) } else { vault.join(format!("{base} {i}.md")) })
+            .map(|i| if i == 0 { dir.join(format!("{base}.md")) } else { dir.join(format!("{base} {i}.md")) })
             .find(|p| !p.exists())
             .unwrap();
         if let Err(e) = std::fs::write(&path, "") {
@@ -589,6 +832,8 @@ impl App {
         self.switching.set(false);
 
         *self.vault.borrow_mut() = Some(dir.clone());
+        self.search_entry.set_text("");
+        self.search_results.set(Vec::new(), &dir, "");
         self.tree.set_root(Some(&dir));
         self.config.borrow_mut().remember_vault(&dir);
 
@@ -722,6 +967,23 @@ impl App {
                 }
             }
             "vault" => self.open_vault(PathBuf::from(arg)),
+            "follow" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.debug_follow(arg.parse().unwrap_or(0), false);
+                }
+            }
+            "keys" => {
+                if let Some(e) = gtk::prelude::GtkWindowExt::focus(&self.window).and_downcast::<gtk::Text>() {
+                    e.set_text(arg);
+                }
+            }
+            "enter" => {
+                let f = gtk::prelude::GtkWindowExt::focus(&self.window);
+                if let Some(e) = f.and_then(|f| f.ancestor(gtk::SearchEntry::static_type())) {
+                    e.emit_by_name::<()>("activate", &[]);
+                }
+            }
+            "side" => self.show_side(arg),
             "action" => {
                 let _ = gtk::prelude::WidgetExt::activate_action(&self.window, arg, None);
             }
