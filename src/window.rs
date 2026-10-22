@@ -1,0 +1,752 @@
+//! Main window: vault sidebar, tabs, settings, session.
+
+use crate::config::{Config, Session};
+use crate::i18n::tr;
+use crate::note::{self, Note};
+use crate::theme::{self, Styles};
+use crate::tree::{self, Tree};
+use adw::prelude::*;
+use gtk::{gio, glib};
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+
+const IMAGES: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif"];
+
+enum Content {
+    Empty,
+    Note(Rc<Note>),
+    /// Images and canvases: read-only views.
+    File(PathBuf),
+}
+
+struct Tab {
+    page: adw::TabPage,
+    bin: adw::Bin,
+    content: RefCell<Content>,
+}
+
+impl Tab {
+    fn path(&self) -> Option<PathBuf> {
+        match &*self.content.borrow() {
+            Content::Empty => None,
+            Content::Note(n) => Some(n.path.borrow().clone()),
+            Content::File(p) => Some(p.clone()),
+        }
+    }
+
+    fn note(&self) -> Option<Rc<Note>> {
+        match &*self.content.borrow() {
+            Content::Note(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+}
+
+pub struct App {
+    window: adw::ApplicationWindow,
+    split: adw::OverlaySplitView,
+    tab_view: adw::TabView,
+    toasts: adw::ToastOverlay,
+    status: gtk::Label,
+    vault_button: gtk::MenuButton,
+    tree: Tree,
+    styles: Rc<Styles>,
+    theme_css: gtk::CssProvider,
+    config: RefCell<Config>,
+    vault: RefCell<Option<PathBuf>>,
+    tabs: RefCell<Vec<Rc<Tab>>>,
+    /// Set while a vault switch closes every tab.
+    switching: Cell<bool>,
+}
+
+pub fn find_vault_root(file: &Path) -> PathBuf {
+    let parent = file.parent().unwrap_or(Path::new("/"));
+    parent
+        .ancestors()
+        .find(|d| d.join(".obsidian").is_dir())
+        .unwrap_or(parent)
+        .to_path_buf()
+}
+
+impl App {
+    pub fn new(app: &adw::Application, config: Config) -> Rc<App> {
+        let styles = Rc::new(Styles::new());
+
+        let window = adw::ApplicationWindow::builder()
+            .application(app)
+            .title("gtkdown")
+            .default_width(config.width)
+            .default_height(config.height)
+            .maximized(config.maximized)
+            .build();
+
+        // Sidebar.
+        let new_note = gtk::Button::from_icon_name("document-new-symbolic");
+        new_note.set_tooltip_text(Some(tr("New note")));
+        new_note.set_action_name(Some("win.new-note"));
+        let side_header = adw::HeaderBar::new();
+        side_header.set_show_end_title_buttons(false);
+        side_header.set_title_widget(Some(&gtk::Label::new(None)));
+        side_header.pack_end(&new_note);
+
+        let weak: Rc<RefCell<Weak<App>>> = Rc::new(RefCell::new(Weak::new()));
+        let w = weak.clone();
+        let tree = Tree::new(move |path, new_tab| {
+            if let Some(a) = w.borrow().upgrade() {
+                a.open_file(path, new_tab);
+            }
+        });
+        let tree_scroll = gtk::ScrolledWindow::builder()
+            .child(&tree.view)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+
+        let vault_button = gtk::MenuButton::builder()
+            .direction(gtk::ArrowType::Up)
+            .always_show_arrow(true)
+            .hexpand(true)
+            .css_classes(["flat"])
+            .build();
+        let settings_menu = gio::Menu::new();
+        let theme_menu = gio::Menu::new();
+        for t in theme::THEMES {
+            theme_menu.append(Some(tr(t.name)), Some(&format!("app.theme::{}", t.id)));
+        }
+        settings_menu.append_section(Some(tr("Theme")), &theme_menu);
+        let lang_menu = gio::Menu::new();
+        lang_menu.append(Some(tr("Automatic")), Some("app.lang::auto"));
+        lang_menu.append(Some("Русский"), Some("app.lang::ru"));
+        lang_menu.append(Some("English"), Some("app.lang::en"));
+        settings_menu.append_section(Some(tr("Language")), &lang_menu);
+        let settings_button = gtk::MenuButton::builder()
+            .icon_name("emblem-system-symbolic")
+            .direction(gtk::ArrowType::Up)
+            .menu_model(&settings_menu)
+            .tooltip_text(tr("Settings"))
+            .css_classes(["flat"])
+            .build();
+        let side_bottom = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        side_bottom.set_margin_start(6);
+        side_bottom.set_margin_end(6);
+        side_bottom.set_margin_top(4);
+        side_bottom.set_margin_bottom(6);
+        side_bottom.append(&vault_button);
+        side_bottom.append(&settings_button);
+
+        let sidebar = adw::ToolbarView::new();
+        sidebar.add_top_bar(&side_header);
+        sidebar.set_content(Some(&tree_scroll));
+        sidebar.add_bottom_bar(&side_bottom);
+
+        // Content: tabs.
+        let tab_view = adw::TabView::new();
+        let tab_bar = adw::TabBar::builder().view(&tab_view).autohide(false).hexpand(true).build();
+        let add_tab = gtk::Button::from_icon_name("list-add-symbolic");
+        add_tab.set_tooltip_text(Some(tr("New tab")));
+        add_tab.set_action_name(Some("win.new-tab"));
+        add_tab.add_css_class("flat");
+        tab_bar.set_end_action_widget(Some(&add_tab));
+
+        let split = adw::OverlaySplitView::builder().sidebar(&sidebar).min_sidebar_width(200.0).build();
+        let toggle = gtk::ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .tooltip_text(tr("Toggle sidebar"))
+            .build();
+        split.bind_property("show-sidebar", &toggle, "active").bidirectional().sync_create().build();
+
+        let header = adw::HeaderBar::new();
+        header.pack_start(&toggle);
+        header.set_title_widget(Some(&tab_bar));
+        split
+            .bind_property("show-sidebar", &header, "show-start-title-buttons")
+            .invert_boolean()
+            .sync_create()
+            .build();
+
+        let status = gtk::Label::builder().halign(gtk::Align::End).build();
+        status.add_css_class("statusbar");
+
+        let content = adw::ToolbarView::new();
+        content.add_top_bar(&header);
+        content.set_content(Some(&tab_view));
+        content.add_bottom_bar(&status);
+        split.set_content(Some(&content));
+
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&split));
+        window.set_content(Some(&toasts));
+
+        // Responsive: sidebar overlays on narrow windows.
+        let bp = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            600.0,
+            adw::LengthUnit::Sp,
+        ));
+        bp.add_setter(&split, "collapsed", Some(&true.to_value()));
+        window.add_breakpoint(bp);
+
+        let theme_css = gtk::CssProvider::new();
+        let display = gtk::prelude::WidgetExt::display(&window);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &theme_css,
+            gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
+        );
+        let base = gtk::CssProvider::new();
+        base.load_from_string(theme::BASE_CSS);
+        gtk::style_context_add_provider_for_display(&display, &base, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let user_css = crate::config::user_css_path();
+        if user_css.is_file() {
+            let p = gtk::CssProvider::new();
+            p.load_from_path(&user_css);
+            gtk::style_context_add_provider_for_display(&display, &p, gtk::STYLE_PROVIDER_PRIORITY_USER + 2);
+        }
+
+        let this = Rc::new(App {
+            window,
+            split,
+            tab_view,
+            toasts,
+            status,
+            vault_button,
+            tree,
+            styles,
+            theme_css,
+            config: RefCell::new(config),
+            vault: RefCell::new(None),
+            tabs: RefCell::new(Vec::new()),
+            switching: Cell::new(false),
+        });
+        *weak.borrow_mut() = Rc::downgrade(&this);
+        this.setup_actions(app);
+        this.setup_signals();
+        this.apply_theme();
+        this.rebuild_vault_menu();
+        this
+    }
+
+    pub fn present(&self) {
+        self.window.present();
+    }
+
+    fn setup_actions(self: &Rc<Self>, app: &adw::Application) {
+        let win_action = |name: &str, f: fn(&Rc<App>)| {
+            let a = gio::SimpleAction::new(name, None);
+            let weak = Rc::downgrade(self);
+            a.connect_activate(move |_, _| {
+                if let Some(s) = weak.upgrade() {
+                    f(&s);
+                }
+            });
+            self.window.add_action(&a);
+        };
+        win_action("new-tab", |s| {
+            let t = s.new_tab();
+            s.tab_view.set_selected_page(&t.page);
+        });
+        win_action("close-tab", |s| {
+            if let Some(p) = s.tab_view.selected_page() {
+                s.tab_view.close_page(&p);
+            }
+        });
+        win_action("new-note", |s| s.new_note());
+        win_action("save", |s| s.save_all());
+        win_action("toggle-sidebar", |s| s.split.set_show_sidebar(!s.split.shows_sidebar()));
+        win_action("choose-vault", |s| s.choose_vault());
+
+        let open_vault = gio::SimpleAction::new("open-vault", Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(self);
+        open_vault.connect_activate(move |_, v| {
+            if let (Some(s), Some(p)) = (weak.upgrade(), v.and_then(|v| v.get::<String>())) {
+                s.open_vault(PathBuf::from(p));
+            }
+        });
+        self.window.add_action(&open_vault);
+
+        let theme_id = self.config.borrow().theme.clone();
+        let theme = gio::SimpleAction::new_stateful("theme", Some(glib::VariantTy::STRING), &theme_id.to_variant());
+        let weak = Rc::downgrade(self);
+        theme.connect_activate(move |a, v| {
+            let (Some(s), Some(v)) = (weak.upgrade(), v) else { return };
+            a.set_state(v);
+            s.config.borrow_mut().theme = v.get::<String>().unwrap_or_default();
+            s.apply_theme();
+            s.config.borrow().save();
+        });
+        app.add_action(&theme);
+
+        let lang_id = self.config.borrow().lang.clone();
+        let lang = gio::SimpleAction::new_stateful("lang", Some(glib::VariantTy::STRING), &lang_id.to_variant());
+        let weak = Rc::downgrade(self);
+        lang.connect_activate(move |a, v| {
+            let (Some(s), Some(v)) = (weak.upgrade(), v) else { return };
+            a.set_state(v);
+            s.config.borrow_mut().lang = v.get::<String>().unwrap_or_default();
+            s.config.borrow().save();
+            s.toast(tr("Restart the app to change the language"));
+        });
+        app.add_action(&lang);
+
+        app.set_accels_for_action("win.new-tab", &["<Ctrl>t"]);
+        app.set_accels_for_action("win.close-tab", &["<Ctrl>w"]);
+        app.set_accels_for_action("win.new-note", &["<Ctrl>n"]);
+        app.set_accels_for_action("win.save", &["<Ctrl>s"]);
+        app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+    }
+
+    fn setup_signals(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_close_page(move |tv, page| {
+            if let Some(s) = weak.upgrade() {
+                let tab = s.tab_for(page);
+                if let Some(n) = tab.as_ref().and_then(|t| t.note()) {
+                    n.save();
+                }
+                s.tabs.borrow_mut().retain(|t| &t.page != page);
+                tv.close_page_finish(page, true);
+                if tv.n_pages() == 0 && !s.switching.get() {
+                    let t = s.new_tab();
+                    tv.set_selected_page(&t.page);
+                }
+            }
+            glib::Propagation::Stop
+        });
+
+        let weak = Rc::downgrade(self);
+        self.tab_view.connect_selected_page_notify(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.on_tab_switched();
+            }
+        });
+
+        let sm = adw::StyleManager::default();
+        for prop in ["dark", "accent-color"] {
+            let weak = Rc::downgrade(self);
+            sm.connect_notify_local(Some(prop), move |_, _| {
+                if let Some(s) = weak.upgrade() {
+                    s.apply_palette();
+                }
+            });
+        }
+
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |w| {
+            if let Some(s) = weak.upgrade() {
+                s.save_all();
+                s.store_session();
+                let mut c = s.config.borrow_mut();
+                c.maximized = w.is_maximized();
+                if !c.maximized {
+                    let (width, height) = w.default_size();
+                    c.width = width;
+                    c.height = height;
+                }
+                c.save();
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    fn apply_theme(&self) {
+        let t = theme::by_id(&self.config.borrow().theme);
+        adw::StyleManager::default().set_color_scheme(t.scheme);
+        self.theme_css.load_from_string(&t.css());
+        self.apply_palette();
+    }
+
+    fn apply_palette(&self) {
+        let t = theme::by_id(&self.config.borrow().theme);
+        let sm = adw::StyleManager::default();
+        self.styles.apply(t, sm.is_dark(), Some(sm.accent_color_rgba()));
+    }
+
+    fn toast(&self, msg: &str) {
+        self.toasts.add_toast(adw::Toast::new(msg));
+    }
+
+    fn tab_for(&self, page: &adw::TabPage) -> Option<Rc<Tab>> {
+        self.tabs.borrow().iter().find(|t| &t.page == page).cloned()
+    }
+
+    fn current_tab(&self) -> Option<Rc<Tab>> {
+        self.tab_view.selected_page().and_then(|p| self.tab_for(&p))
+    }
+
+    fn new_tab(self: &Rc<Self>) -> Rc<Tab> {
+        let bin = adw::Bin::new();
+        let page = self.tab_view.append(&bin);
+        let tab = Rc::new(Tab { page, bin, content: RefCell::new(Content::Empty) });
+        self.tabs.borrow_mut().push(tab.clone());
+        self.set_content(&tab, Content::Empty);
+        tab
+    }
+
+    fn empty_page(self: &Rc<Self>) -> gtk::Widget {
+        let page = adw::StatusPage::builder().icon_name("text-x-generic-symbolic").build();
+        if self.vault.borrow().is_some() {
+            page.set_title(tr("No file is open"));
+            page.set_description(Some(tr("Open a note from the sidebar or create a new one")));
+            let b = gtk::Button::with_label(tr("New note"));
+            b.set_action_name(Some("win.new-note"));
+            b.set_halign(gtk::Align::Center);
+            b.add_css_class("pill");
+            page.set_child(Some(&b));
+        } else {
+            page.set_title(tr("No vault"));
+            page.set_description(Some(tr("Open a folder with notes — an Obsidian vault works as is")));
+            let b = gtk::Button::with_label(tr("Open vault"));
+            b.set_action_name(Some("win.choose-vault"));
+            b.set_halign(gtk::Align::Center);
+            b.add_css_class("pill");
+            b.add_css_class("suggested-action");
+            page.set_child(Some(&b));
+        }
+        page.upcast()
+    }
+
+    fn set_content(self: &Rc<Self>, tab: &Rc<Tab>, content: Content) {
+        if let Some(old) = tab.note() {
+            old.save();
+        }
+        let widget: gtk::Widget = match &content {
+            Content::Empty => self.empty_page(),
+            Content::Note(n) => n.widget.clone().upcast(),
+            Content::File(p) => {
+                if tree::ext(&p.to_string_lossy()).is_some_and(|e| e == "canvas") {
+                    adw::StatusPage::builder()
+                        .icon_name("view-grid-symbolic")
+                        .title(p.file_stem().unwrap_or_default().to_string_lossy())
+                        .description(tr("Canvas view is coming in a later version"))
+                        .build()
+                        .upcast()
+                } else {
+                    let pic = gtk::Picture::for_filename(p);
+                    pic.set_content_fit(gtk::ContentFit::ScaleDown);
+                    pic.set_margin_top(24);
+                    pic.set_margin_bottom(24);
+                    pic.upcast()
+                }
+            }
+        };
+        tab.bin.set_child(Some(&widget));
+        *tab.content.borrow_mut() = content;
+        self.update_tab_title(tab);
+
+        if let Some(n) = tab.note() {
+            let (wa, wt) = (Rc::downgrade(self), Rc::downgrade(tab));
+            *n.on_stats.borrow_mut() = Some(Box::new(move |words, chars| {
+                if let (Some(a), Some(t)) = (wa.upgrade(), wt.upgrade())
+                    && a.tab_view.selected_page().as_ref() == Some(&t.page)
+                {
+                    a.set_status(words, chars);
+                }
+            }));
+            let wa = Rc::downgrade(self);
+            *n.on_error.borrow_mut() = Some(Box::new(move |msg| {
+                if let Some(a) = wa.upgrade() {
+                    a.toast(&format!("{}: {msg}", tr("Cannot save file")));
+                }
+            }));
+            let (wa, wt) = (Rc::downgrade(self), Rc::downgrade(tab));
+            *n.on_gone.borrow_mut() = Some(Box::new(move || {
+                if let (Some(a), Some(t)) = (wa.upgrade(), wt.upgrade()) {
+                    a.set_content(&t, Content::Empty);
+                }
+            }));
+            let (wa, wt) = (Rc::downgrade(self), Rc::downgrade(tab));
+            *n.on_renamed.borrow_mut() = Some(Box::new(move || {
+                if let (Some(a), Some(t)) = (wa.upgrade(), wt.upgrade()) {
+                    a.update_tab_title(&t);
+                }
+            }));
+        }
+        if self.tab_view.selected_page().as_ref() == Some(&tab.page) {
+            self.on_tab_switched();
+        }
+    }
+
+    fn update_tab_title(&self, tab: &Tab) {
+        match tab.path() {
+            Some(p) => {
+                tab.page.set_title(&p.file_stem().unwrap_or_default().to_string_lossy());
+                tab.page.set_tooltip(&glib::markup_escape_text(&p.to_string_lossy()));
+            }
+            None => {
+                tab.page.set_title(tr("New tab"));
+                tab.page.set_tooltip("");
+            }
+        }
+    }
+
+    fn set_status(&self, words: usize, chars: usize) {
+        self.status.set_label(&format!("{}: {words}   {}: {chars}", tr("Words"), tr("Characters")));
+    }
+
+    fn on_tab_switched(&self) {
+        let tab = self.current_tab();
+        let path = tab.as_ref().and_then(|t| t.path());
+        self.tree.select(path.as_deref());
+        match tab.as_ref().and_then(|t| t.note()) {
+            Some(n) => {
+                let text = n.text();
+                self.set_status(note::count_words(&text), text.chars().count());
+                n.view.grab_focus();
+            }
+            None => self.status.set_label(""),
+        }
+        let title = path.and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+        self.window.set_title(Some(&match title {
+            Some(t) => format!("{t} — gtkdown"),
+            None => "gtkdown".into(),
+        }));
+    }
+
+    pub fn open_file(self: &Rc<Self>, path: PathBuf, new_tab: bool) {
+        let existing = self.tabs.borrow().iter().find(|t| t.path().as_ref() == Some(&path)).cloned();
+        if let Some(t) = existing {
+            self.tab_view.set_selected_page(&t.page);
+            return;
+        }
+        let ext = tree::ext(&path.to_string_lossy()).unwrap_or_default();
+        let content = if ext == "md" {
+            match Note::open(&path, self.styles.clone()) {
+                Ok(n) => Content::Note(n),
+                Err(e) => {
+                    self.toast(&format!("{}: {e}", tr("Cannot open file")));
+                    return;
+                }
+            }
+        } else if ext == "canvas" || IMAGES.contains(&ext.as_str()) {
+            Content::File(path)
+        } else {
+            gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(
+                Some(&self.window),
+                gio::Cancellable::NONE,
+                |_| {},
+            );
+            return;
+        };
+        let tab = match self.current_tab() {
+            Some(t) if !new_tab => t,
+            _ => self.new_tab(),
+        };
+        self.set_content(&tab, content);
+        self.tab_view.set_selected_page(&tab.page);
+    }
+
+    fn new_note(self: &Rc<Self>) {
+        let Some(vault) = self.vault.borrow().clone() else { return };
+        let base = tr("Untitled");
+        let path = (0..)
+            .map(|i| if i == 0 { vault.join(format!("{base}.md")) } else { vault.join(format!("{base} {i}.md")) })
+            .find(|p| !p.exists())
+            .unwrap();
+        if let Err(e) = std::fs::write(&path, "") {
+            self.toast(&format!("{}: {e}", tr("Cannot save file")));
+            return;
+        }
+        let blank = self.current_tab().is_some_and(|t| matches!(*t.content.borrow(), Content::Empty));
+        self.open_file(path, !blank && self.current_tab().is_some_and(|t| t.note().is_some()));
+    }
+
+    fn save_all(&self) {
+        for t in self.tabs.borrow().iter() {
+            if let Some(n) = t.note() {
+                n.save();
+            }
+        }
+    }
+
+    fn store_session(&self) {
+        let Some(vault) = self.vault.borrow().clone() else { return };
+        let tabs = self.tabs.borrow();
+        let paths: Vec<String> = tabs
+            .iter()
+            .filter_map(|t| t.path())
+            .filter_map(|p| p.strip_prefix(&vault).ok().map(|r| r.to_string_lossy().into_owned()))
+            .collect();
+        let active = self
+            .current_tab()
+            .and_then(|c| c.path())
+            .and_then(|p| tabs.iter().filter_map(|t| t.path()).position(|q| q == p))
+            .unwrap_or(0);
+        self.config.borrow_mut().set_session(Session { vault, active, tabs: paths });
+    }
+
+    pub fn open_vault(self: &Rc<Self>, dir: PathBuf) {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if self.vault.borrow().as_ref() == Some(&dir) {
+            return;
+        }
+        self.save_all();
+        self.store_session();
+        self.switching.set(true);
+        for t in self.tabs.take() {
+            self.tab_view.close_page(&t.page);
+        }
+        self.switching.set(false);
+
+        *self.vault.borrow_mut() = Some(dir.clone());
+        self.tree.set_root(Some(&dir));
+        self.config.borrow_mut().remember_vault(&dir);
+
+        let session = self.config.borrow().session(&dir).cloned();
+        if let Some(s) = &session {
+            for rel in &s.tabs {
+                let p = dir.join(rel);
+                if p.is_file() {
+                    self.open_file(p, true);
+                }
+            }
+        }
+        if self.tabs.borrow().is_empty() {
+            let t = self.new_tab();
+            self.tab_view.set_selected_page(&t.page);
+        } else if let Some(s) = &session {
+            let active = s.tabs.get(s.active).map(|r| dir.join(r));
+            if let Some(t) = self.tabs.borrow().iter().find(|t| t.path() == active) {
+                self.tab_view.set_selected_page(&t.page);
+            }
+        }
+        self.rebuild_vault_menu();
+        self.config.borrow().save();
+    }
+
+    fn choose_vault(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::builder().title(tr("Open vault")).modal(true).build();
+        let weak = Rc::downgrade(self);
+        dialog.select_folder(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let (Some(s), Ok(f)) = (weak.upgrade(), res)
+                && let Some(p) = f.path()
+            {
+                s.open_vault(p);
+            }
+        });
+    }
+
+    fn rebuild_vault_menu(&self) {
+        let name = self
+            .vault
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| tr("No vault").into());
+        self.vault_button.set_label(&name);
+
+        let menu = gio::Menu::new();
+        let vaults = gio::Menu::new();
+        for v in self.config.borrow().known_vaults() {
+            let label = v.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let item = gio::MenuItem::new(Some(&label), None);
+            item.set_action_and_target_value(Some("win.open-vault"), Some(&v.to_string_lossy().to_variant()));
+            vaults.append_item(&item);
+        }
+        menu.append_section(None, &vaults);
+        let actions = gio::Menu::new();
+        actions.append(Some(tr("Open folder as vault…")), Some("win.choose-vault"));
+        menu.append_section(None, &actions);
+        self.vault_button.set_menu_model(Some(&menu));
+    }
+
+    /// Reopens the last vault on a plain launch.
+    pub fn restore(self: &Rc<Self>) {
+        let last = self.config.borrow().last_vault.clone();
+        match last {
+            Some(v) if v.is_dir() => self.open_vault(v),
+            _ => self.ensure_tab(),
+        }
+    }
+
+    pub fn ensure_tab(self: &Rc<Self>) {
+        if self.tabs.borrow().is_empty() {
+            let t = self.new_tab();
+            self.tab_view.set_selected_page(&t.page);
+        }
+    }
+}
+
+/// Debug-build test driver: GTKDOWN_TEST="open:Arch/База.md;cursor:40;type:x;shot:/tmp/a.png;quit".
+#[cfg(debug_assertions)]
+impl App {
+    pub fn run_script(self: &Rc<Self>, script: String) {
+        let steps: Vec<String> = script.split(';').map(String::from).collect();
+        self.clone().script_step(steps, 0);
+    }
+
+    fn script_step(self: Rc<Self>, steps: Vec<String>, i: usize) {
+        let Some(step) = steps.get(i) else { return };
+        let (cmd, arg) = step.split_once(':').unwrap_or((step, ""));
+        let mut delay = 300;
+        match cmd {
+            "wait" => delay = arg.parse().unwrap_or(500),
+            "open" => {
+                let p = self.vault.borrow().clone().unwrap_or_default().join(arg);
+                self.open_file(p, false);
+            }
+            "tab" => self.open_file(self.vault.borrow().clone().unwrap_or_default().join(arg), true),
+            "cursor" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    let it = n.buffer.iter_at_offset(arg.parse().unwrap_or(0));
+                    n.buffer.place_cursor(&it);
+                    n.view.scroll_to_mark(&n.buffer.get_insert(), 0.0, true, 0.0, 0.3);
+                }
+            }
+            "type" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.buffer.insert_at_cursor(&arg.replace("\\n", "\n"));
+                }
+            }
+            "click-task" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.debug_toggle_task(arg.parse().unwrap_or(0));
+                }
+            }
+            "theme" => {
+                self.config.borrow_mut().theme = arg.into();
+                self.apply_theme();
+            }
+            "size" => {
+                let (w, h) = arg.split_once('x').unwrap_or(("1200", "800"));
+                self.window.set_default_size(w.parse().unwrap_or(1200), h.parse().unwrap_or(800));
+            }
+            "shot" => {
+                let paintable = gtk::WidgetPaintable::new(Some(&self.window));
+                let (w, h) = (self.window.width(), self.window.height());
+                let snap = gtk::Snapshot::new();
+                paintable.snapshot(&snap, w as f64, h as f64);
+                if let (Some(node), Some(r)) = (snap.to_node(), self.window.native().and_then(|n| n.renderer())) {
+                    let tex = r.render_texture(&node, None);
+                    let _ = tex.save_to_png(arg);
+                }
+            }
+            "vault" => self.open_vault(PathBuf::from(arg)),
+            "action" => {
+                let _ = gtk::prelude::WidgetExt::activate_action(&self.window, arg, None);
+            }
+            "append" => {
+                use std::io::Write;
+                let (rel, text) = arg.split_once(':').unwrap_or((arg, ""));
+                let p = self.vault.borrow().clone().unwrap_or_default().join(rel);
+                let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+                let _ = f.write_all(text.replace("\\n", "\n").as_bytes());
+            }
+            "print" => {
+                let p = self.vault.borrow().clone().unwrap_or_default().join(arg);
+                eprintln!("PRINT {arg}: {:?}", std::fs::read_to_string(p).unwrap_or_default());
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    eprintln!("BUFFER: {:?}", n.text());
+                }
+            }
+            "quit" => {
+                self.window.close();
+                return;
+            }
+            _ => eprintln!("gtkdown test: unknown step {step}"),
+        }
+        glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+            self.script_step(steps, i + 1)
+        });
+    }
+}
