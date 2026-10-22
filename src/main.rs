@@ -1,4 +1,5 @@
 mod config;
+mod fileops;
 mod i18n;
 mod markdown;
 mod note;

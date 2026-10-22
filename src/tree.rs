@@ -2,7 +2,9 @@
 
 use adw::prelude::*;
 use gtk::{gio, glib};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 const ATTRS: &str = "standard::name,standard::display-name,standard::type,standard::is-hidden";
 
@@ -59,15 +61,31 @@ pub struct Tree {
     selection: gtk::SingleSelection,
 }
 
+/// What the user did in the tree.
+pub enum TreeEvent {
+    Open(PathBuf, bool),
+    /// Right click on a row (path, is_dir) or on empty space (None), at x/y in `widget`.
+    Menu(Option<(PathBuf, bool)>, gtk::Widget, f64, f64),
+    /// Drag `from` into folder `to_dir`.
+    Move(PathBuf, PathBuf),
+}
+
+fn row_info(item: &glib::WeakRef<gtk::ListItem>) -> Option<(PathBuf, bool)> {
+    let row = item.upgrade()?.item().and_downcast::<gtk::TreeListRow>()?;
+    let info = row.item().and_downcast::<gio::FileInfo>()?;
+    Some((file_of(&info)?.path()?, is_dir(&info)))
+}
+
 impl Tree {
-    /// `on_open(path, new_tab)` fires for files; folders toggle open/closed.
-    pub fn new(on_open: impl Fn(PathBuf, bool) + 'static) -> Tree {
+    /// Folders toggle open/closed on click; everything else is reported through `on_event`.
+    pub fn new(root: Rc<RefCell<Option<PathBuf>>>, on_event: impl Fn(TreeEvent) + 'static) -> Tree {
         let selection = gtk::SingleSelection::new(None::<gio::ListModel>);
         selection.set_autoselect(false);
         selection.set_can_unselect(true);
 
         let factory = gtk::SignalListItemFactory::new();
-        let on_open = std::rc::Rc::new(on_open);
+        let on_event = Rc::new(on_event);
+        let ev = on_event.clone();
         factory.connect_setup(move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let label = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
@@ -83,11 +101,25 @@ impl Tree {
             let click = gtk::GestureClick::new();
             click.set_button(0);
             let weak_item = item.downgrade();
-            let on_open = on_open.clone();
+            let on_event = ev.clone();
+            click.connect_pressed(move |g, _, x, y| {
+                if g.current_button() != 3 {
+                    return;
+                }
+                g.set_state(gtk::EventSequenceState::Claimed);
+                if let (Some(info), Some(w)) = (row_info(&weak_item), g.widget()) {
+                    on_event(TreeEvent::Menu(Some(info), w, x, y));
+                }
+            });
+            let weak_item = item.downgrade();
+            let on_event = ev.clone();
             click.connect_released(move |g, n, _, _| {
                 let Some(item) = weak_item.upgrade() else { return };
                 let Some(row) = item.item().and_downcast::<gtk::TreeListRow>() else { return };
                 let Some(info) = row.item().and_downcast::<gio::FileInfo>() else { return };
+                if g.current_button() == 3 {
+                    return;
+                }
                 if is_dir(&info) {
                     if n == 1 {
                         row.set_expanded(!row.is_expanded());
@@ -97,10 +129,37 @@ impl Tree {
                 let ctrl = g.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
                 let new_tab = ctrl || g.current_button() == 2;
                 if let Some(path) = file_of(&info).and_then(|f| f.path()) {
-                    on_open(path, new_tab);
+                    on_event(TreeEvent::Open(path, new_tab));
                 }
             });
             expander.add_controller(click);
+
+            let drag = gtk::DragSource::new();
+            drag.set_actions(gtk::gdk::DragAction::MOVE);
+            let weak_item = item.downgrade();
+            drag.connect_prepare(move |_, _, _| {
+                let (path, _) = row_info(&weak_item)?;
+                Some(gtk::gdk::ContentProvider::for_value(&gio::File::for_path(path).to_value()))
+            });
+            expander.add_controller(drag);
+
+            let drop = gtk::DropTarget::new(gio::File::static_type(), gtk::gdk::DragAction::MOVE);
+            let weak_item = item.downgrade();
+            let on_event = ev.clone();
+            drop.connect_drop(move |_, value, _, _| {
+                let (Ok(src), Some((path, dir))) = (value.get::<gio::File>(), row_info(&weak_item)) else {
+                    return false;
+                };
+                let dest = if dir { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
+                match src.path() {
+                    Some(src) => {
+                        on_event(TreeEvent::Move(src, dest));
+                        true
+                    }
+                    None => false,
+                }
+            });
+            expander.add_controller(drop);
             item.set_child(Some(&expander));
         });
         factory.connect_bind(|_, item| {
@@ -138,6 +197,29 @@ impl Tree {
         let view = gtk::ListView::new(Some(selection.clone()), Some(factory));
         view.add_css_class("navigation-sidebar");
         view.add_css_class("vault-tree");
+
+        // Right click / drop on empty space acts on the vault root.
+        let click = gtk::GestureClick::new();
+        click.set_button(3);
+        let ev = on_event.clone();
+        click.connect_pressed(move |g, _, x, y| {
+            if let Some(w) = g.widget() {
+                ev(TreeEvent::Menu(None, w, x, y));
+            }
+        });
+        view.add_controller(click);
+        let drop = gtk::DropTarget::new(gio::File::static_type(), gtk::gdk::DragAction::MOVE);
+        drop.connect_drop(move |_, value, _, _| {
+            let (Ok(src), Some(dest)) = (value.get::<gio::File>(), root.borrow().clone()) else { return false };
+            match src.path() {
+                Some(src) => {
+                    on_event(TreeEvent::Move(src, dest));
+                    true
+                }
+                None => false,
+            }
+        });
+        view.add_controller(drop);
         Tree { view, selection }
     }
 

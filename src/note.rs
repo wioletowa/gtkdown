@@ -331,6 +331,10 @@ impl Note {
             return;
         }
         let path = self.path.borrow().clone();
+        // Deleted (by us or outside): don't resurrect it.
+        if !path.exists() {
+            return;
+        }
         match std::fs::write(&path, &text) {
             Ok(()) => *self.saved.borrow_mut() = text,
             Err(e) => {
@@ -339,6 +343,12 @@ impl Note {
                 }
             }
         }
+    }
+
+    /// After the file was moved by us: follow it without reloading.
+    pub fn set_path(self: &Rc<Self>, path: PathBuf) {
+        *self.path.borrow_mut() = path;
+        self.watch();
     }
 
     fn watch(self: &Rc<Self>) {

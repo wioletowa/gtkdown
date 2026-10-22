@@ -66,6 +66,17 @@ pub fn tr(en: &'static str) -> &'static str {
         "Headings" => "Заголовки",
         "Large" => "Крупные",
         "Compact" => "Компактные",
+        "New folder" => "Новая папка",
+        "Open in new tab" => "Открыть в новой вкладке",
+        "Rename…" => "Переименовать…",
+        "Rename" => "Переименовать",
+        "Delete" => "Удалить",
+        "Cancel" => "Отмена",
+        "Invalid name" => "Недопустимое имя",
+        "The folder and everything in it will be deleted." => "Папка и всё её содержимое будут удалены.",
+        "Cannot delete" => "Не удалось удалить",
+        "Cannot move" => "Не удалось переместить",
+        "Links updated in notes" => "Ссылки обновлены в заметках",
         _ => en,
     }
 }

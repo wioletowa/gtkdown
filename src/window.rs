@@ -5,7 +5,8 @@ use crate::i18n::tr;
 use crate::note::{self, Note};
 use crate::theme::{self, Styles};
 use crate::panels::{self, Results};
-use crate::tree::{self, Tree};
+use crate::fileops;
+use crate::tree::{self, Tree, TreeEvent};
 use crate::vault;
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -72,7 +73,7 @@ pub struct App {
     theme_css: gtk::CssProvider,
     font_css: gtk::CssProvider,
     config: RefCell<Config>,
-    vault: RefCell<Option<PathBuf>>,
+    vault: Rc<RefCell<Option<PathBuf>>>,
     tabs: RefCell<Vec<Rc<Tab>>>,
     /// Set while a vault switch closes every tab.
     switching: Cell<bool>,
@@ -146,9 +147,20 @@ impl App {
 
         let weak: Rc<RefCell<Weak<App>>> = Rc::new(RefCell::new(Weak::new()));
         let w = weak.clone();
-        let tree = Tree::new(move |path, new_tab| {
-            if let Some(a) = w.borrow().upgrade() {
-                a.open_file(path, new_tab);
+        let vault: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+        let tree = Tree::new(vault.clone(), move |ev| {
+            let Some(a) = w.borrow().upgrade() else { return };
+            match ev {
+                TreeEvent::Open(path, new_tab) => a.open_file(path, new_tab),
+                TreeEvent::Menu(target, widget, x, y) => a.tree_menu(target, &widget, x, y),
+                TreeEvent::Move(from, dir) => {
+                    if let Some(name) = from.file_name() {
+                        let to = dir.join(name);
+                        if to != from {
+                            a.move_path(&from, &to);
+                        }
+                    }
+                }
             }
         });
         let tree_scroll = gtk::ScrolledWindow::builder()
@@ -317,7 +329,7 @@ impl App {
             theme_css,
             font_css,
             config: RefCell::new(config),
-            vault: RefCell::new(None),
+            vault,
             tabs: RefCell::new(Vec::new()),
             switching: Cell::new(false),
         });
@@ -359,6 +371,26 @@ impl App {
         win_action("toggle-sidebar", |s| s.split.set_show_sidebar(!s.split.shows_sidebar()));
         win_action("choose-vault", |s| s.choose_vault());
         win_action("quick-open", |s| s.quick_open());
+        let path_action = |name: &str, f: fn(&Rc<App>, PathBuf)| {
+            let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let weak = Rc::downgrade(self);
+            a.connect_activate(move |_, v| {
+                if let (Some(s), Some(p)) = (weak.upgrade(), v.and_then(|v| v.get::<String>())) {
+                    f(&s, PathBuf::from(p));
+                }
+            });
+            self.window.add_action(&a);
+        };
+        path_action("note-in", |s, dir| s.new_note_in(&dir));
+        path_action("folder-in", |s, dir| s.new_folder_in(&dir));
+        path_action("rename", |s, p| s.rename_dialog(&p));
+        path_action("delete", |s, p| s.delete_dialog(&p));
+        path_action("open-tab", |s, p| s.open_file(p, true));
+        win_action("rename-current", |s| {
+            if let Some(p) = s.current_tab().and_then(|t| t.path()) {
+                s.rename_dialog(&p);
+            }
+        });
         win_action("choose-font", |s| s.choose_font());
         win_action("reset-font", |s| {
             s.config.borrow_mut().font.clear();
@@ -423,6 +455,7 @@ impl App {
         app.set_accels_for_action("win.save", &["<Ctrl>s"]);
         app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
         app.set_accels_for_action("win.quick-open", &["<Ctrl>o"]);
+        app.set_accels_for_action("win.rename-current", &["F2"]);
         app.set_accels_for_action("win.search", &["<Ctrl><Shift>f"]);
     }
 
@@ -797,6 +830,158 @@ impl App {
         }
     }
 
+    fn tree_menu(self: &Rc<Self>, target: Option<(PathBuf, bool)>, widget: &gtk::Widget, x: f64, y: f64) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let item = |m: &gio::Menu, label: &str, action: &str, p: &Path| {
+            let it = gio::MenuItem::new(Some(label), None);
+            it.set_action_and_target_value(Some(action), Some(&p.to_string_lossy().to_variant()));
+            m.append_item(&it);
+        };
+        let dir = match &target {
+            Some((p, true)) => p.clone(),
+            Some((p, false)) => p.parent().map_or(root.clone(), Path::to_path_buf),
+            None => root.clone(),
+        };
+        let menu = gio::Menu::new();
+        let create = gio::Menu::new();
+        item(&create, tr("New note"), "win.note-in", &dir);
+        item(&create, tr("New folder"), "win.folder-in", &dir);
+        menu.append_section(None, &create);
+        if let Some((p, is_dir)) = &target {
+            let ops = gio::Menu::new();
+            if !is_dir {
+                item(&ops, tr("Open in new tab"), "win.open-tab", p);
+            }
+            item(&ops, tr("Rename…"), "win.rename", p);
+            item(&ops, tr("Delete"), "win.delete", p);
+            menu.append_section(None, &ops);
+        }
+        let pop = gtk::PopoverMenu::from_model(Some(&menu));
+        pop.set_parent(widget);
+        pop.set_has_arrow(false);
+        pop.set_halign(gtk::Align::Start);
+        pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        pop.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        pop.popup();
+    }
+
+    fn new_note_in(self: &Rc<Self>, dir: &Path) {
+        let path = fileops::free_name(dir, tr("Untitled"), "md");
+        match std::fs::write(&path, "") {
+            Ok(()) => self.open_file(path, false),
+            Err(e) => self.toast(&format!("{}: {e}", tr("Cannot save file"))),
+        }
+    }
+
+    fn new_folder_in(self: &Rc<Self>, dir: &Path) {
+        let path = fileops::free_name(dir, tr("Untitled"), "");
+        match std::fs::create_dir(&path) {
+            Ok(()) => self.rename_dialog(&path),
+            Err(e) => self.toast(&format!("{}: {e}", tr("Cannot save file"))),
+        }
+    }
+
+    fn rename_dialog(self: &Rc<Self>, path: &Path) {
+        let is_md = !path.is_dir() && tree::ext(&path.to_string_lossy()).is_some_and(|e| e == "md");
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let shown = if is_md { name.trim_end_matches(".md").to_string() } else { name.clone() };
+        let entry = gtk::Entry::builder().text(&shown).activates_default(true).build();
+        let dialog = adw::AlertDialog::builder().heading(tr("Rename")).extra_child(&entry).build();
+        dialog.add_responses(&[("cancel", tr("Cancel")), ("rename", tr("Rename"))]);
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        let path = path.to_path_buf();
+        let e = entry.clone();
+        dialog.connect_response(None, move |_, resp| {
+            let Some(s) = weak.upgrade() else { return };
+            let new = e.text().trim().to_string();
+            if resp != "rename" || new.is_empty() || new == shown {
+                return;
+            }
+            if new.contains('/') || new.starts_with('.') {
+                s.toast(tr("Invalid name"));
+                return;
+            }
+            let new = if is_md { format!("{new}.md") } else { new };
+            let to = path.with_file_name(new);
+            s.move_path(&path, &to);
+        });
+        dialog.present(Some(&self.window));
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+
+    fn delete_dialog(self: &Rc<Self>, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("{} «{name}»?", tr("Delete")))
+            .body(if path.is_dir() { tr("The folder and everything in it will be deleted.") } else { "" })
+            .build();
+        dialog.add_responses(&[("cancel", tr("Cancel")), ("delete", tr("Delete"))]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        let path = path.to_path_buf();
+        dialog.connect_response(None, move |_, resp| {
+            let Some(s) = weak.upgrade() else { return };
+            if resp != "delete" {
+                return;
+            }
+            let Some(root) = s.vault.borrow().clone() else { return };
+            s.save_all();
+            match fileops::delete(&root, &path) {
+                Ok(()) => {
+                    let gone: Vec<_> = s
+                        .tabs
+                        .borrow()
+                        .iter()
+                        .filter(|t| t.path().is_some_and(|p| p.starts_with(&path)))
+                        .cloned()
+                        .collect();
+                    for t in gone {
+                        s.set_content(&t, Content::Empty);
+                    }
+                }
+                Err(e) => s.toast(&format!("{}: {e}", tr("Cannot delete"))),
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Moves/renames inside the vault, rewriting links and following open tabs.
+    fn move_path(self: &Rc<Self>, from: &Path, to: &Path) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        if !from.starts_with(&root) || !to.starts_with(&root) {
+            return;
+        }
+        self.save_all();
+        match fileops::move_path(&root, from, to) {
+            Ok(n) => {
+                for t in self.tabs.borrow().iter() {
+                    let Some(p) = t.path() else { continue };
+                    let Ok(rest) = p.strip_prefix(from) else { continue };
+                    let new = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+                    match &mut *t.content.borrow_mut() {
+                        Content::Note(n) => n.set_path(new),
+                        Content::File(f) => *f = new,
+                        Content::Empty => {}
+                    }
+                    self.update_tab_title(t);
+                }
+                if n > 0 {
+                    self.toast(&format!("{}: {n}", tr("Links updated in notes")));
+                }
+                self.on_tab_switched();
+            }
+            Err(e) => self.toast(&format!("{}: {e}", tr("Cannot move"))),
+        }
+    }
+
     fn quick_open(self: &Rc<Self>) {
         let Some(root) = self.vault.borrow().clone() else { return };
         let (w1, w2) = (Rc::downgrade(self), Rc::downgrade(self));
@@ -1083,7 +1268,22 @@ impl App {
             }
             "side" => self.show_side(arg),
             "action" => {
-                let _ = gtk::prelude::WidgetExt::activate_action(&self.window, arg, None);
+                let (name, param) = match arg.split_once('=') {
+                    Some((n, p)) => (n, Some(p.to_variant())),
+                    None => (arg, None),
+                };
+                let _ = gtk::prelude::WidgetExt::activate_action(&self.window, name, param.as_ref());
+            }
+            "move" => {
+                let root = self.vault.borrow().clone().unwrap_or_default();
+                let (a, b) = arg.split_once('>').unwrap_or((arg, arg));
+                self.move_path(&root.join(a), &root.join(b));
+            }
+            "treemenu" => {
+                let root = self.vault.borrow().clone().unwrap_or_default();
+                let p = root.join(arg);
+                let dir = p.is_dir();
+                self.tree_menu(Some((p, dir)), &self.tree.view.clone().upcast(), 60.0, 80.0);
             }
             "append" => {
                 use std::io::Write;
