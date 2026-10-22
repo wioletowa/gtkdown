@@ -70,11 +70,21 @@ pub struct App {
     tree: Tree,
     styles: Rc<Styles>,
     theme_css: gtk::CssProvider,
+    font_css: gtk::CssProvider,
     config: RefCell<Config>,
     vault: RefCell<Option<PathBuf>>,
     tabs: RefCell<Vec<Rc<Tab>>>,
     /// Set while a vault switch closes every tab.
     switching: Cell<bool>,
+}
+
+/// CSS font-family value from a family name or an Obsidian-style list (`'Inter', sans-serif`).
+/// A generic fallback is appended so a missing font (e.g. bundled only with Obsidian's flatpak)
+/// degrades to the same kind of face.
+fn css_family(f: &str) -> String {
+    let lower = f.to_lowercase();
+    let generic = if ["mono", "code", "courier"].iter().any(|k| lower.contains(k)) { "monospace" } else { "sans-serif" };
+    if f.contains([',', '"', '\'']) { format!("{f}, {generic}") } else { format!("\"{f}\", {generic}") }
 }
 
 pub fn find_vault_root(file: &Path) -> PathBuf {
@@ -188,6 +198,15 @@ impl App {
         lang_menu.append(Some("Русский"), Some("app.lang::ru"));
         lang_menu.append(Some("English"), Some("app.lang::en"));
         settings_menu.append_section(Some(tr("Language")), &lang_menu);
+        let editor_menu = gio::Menu::new();
+        editor_menu.append(Some(tr("Editor font…")), Some("win.choose-font"));
+        editor_menu.append(Some(tr("Use vault font")), Some("win.reset-font"));
+        let headings_menu = gio::Menu::new();
+        headings_menu.append(Some(tr("Automatic")), Some("app.headings::auto"));
+        headings_menu.append(Some(tr("Large")), Some("app.headings::large"));
+        headings_menu.append(Some(tr("Compact")), Some("app.headings::compact"));
+        editor_menu.append_submenu(Some(tr("Headings")), &headings_menu);
+        settings_menu.append_section(Some(tr("Editor")), &editor_menu);
         let settings_button = gtk::MenuButton::builder()
             .icon_name("emblem-system-symbolic")
             .direction(gtk::ArrowType::Up)
@@ -267,6 +286,8 @@ impl App {
             &theme_css,
             gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
+        let font_css = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(&display, &font_css, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
         let base = gtk::CssProvider::new();
         base.load_from_string(theme::BASE_CSS);
         gtk::style_context_add_provider_for_display(&display, &base, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -294,6 +315,7 @@ impl App {
             tree,
             styles,
             theme_css,
+            font_css,
             config: RefCell::new(config),
             vault: RefCell::new(None),
             tabs: RefCell::new(Vec::new()),
@@ -303,6 +325,7 @@ impl App {
         this.setup_actions(app);
         this.setup_signals();
         this.apply_theme();
+        this.apply_editor_style();
         this.rebuild_vault_menu();
         this
     }
@@ -336,6 +359,12 @@ impl App {
         win_action("toggle-sidebar", |s| s.split.set_show_sidebar(!s.split.shows_sidebar()));
         win_action("choose-vault", |s| s.choose_vault());
         win_action("quick-open", |s| s.quick_open());
+        win_action("choose-font", |s| s.choose_font());
+        win_action("reset-font", |s| {
+            s.config.borrow_mut().font.clear();
+            s.config.borrow().save();
+            s.apply_editor_style();
+        });
         win_action("search", |s| {
             s.show_side("search");
             s.search_entry.grab_focus();
@@ -374,6 +403,19 @@ impl App {
             s.toast(tr("Restart the app to change the language"));
         });
         app.add_action(&lang);
+
+        let headings_id = self.config.borrow().headings.clone();
+        let headings =
+            gio::SimpleAction::new_stateful("headings", Some(glib::VariantTy::STRING), &headings_id.to_variant());
+        let weak = Rc::downgrade(self);
+        headings.connect_activate(move |a, v| {
+            let (Some(s), Some(v)) = (weak.upgrade(), v) else { return };
+            a.set_state(v);
+            s.config.borrow_mut().headings = v.get::<String>().unwrap_or_default();
+            s.config.borrow().save();
+            s.apply_editor_style();
+        });
+        app.add_action(&headings);
 
         app.set_accels_for_action("win.new-tab", &["<Ctrl>t"]);
         app.set_accels_for_action("win.close-tab", &["<Ctrl>w"]);
@@ -464,6 +506,61 @@ impl App {
         let t = theme::by_id(&self.config.borrow().theme);
         let sm = adw::StyleManager::default();
         self.styles.apply(t, sm.is_dark(), Some(sm.accent_color_rgba()));
+    }
+
+    /// Editor font, monospace font and heading sizes: our settings first, then the vault's
+    /// `.obsidian/appearance.json`, then defaults.
+    fn apply_editor_style(self: &Rc<Self>) {
+        let cfg = self.config.borrow().clone();
+        let look = self.vault.borrow().as_deref().map(vault::appearance).unwrap_or_default();
+        let (family, size) = if cfg.font.is_empty() {
+            let size = format!("{}px", look.base_size.unwrap_or(16.0));
+            (look.text_font.as_deref().map(css_family), size)
+        } else {
+            let d = gtk::pango::FontDescription::from_string(&cfg.font);
+            let size = match d.size() {
+                0 => "16px".to_string(),
+                s => format!("{}pt", s as f64 / gtk::pango::SCALE as f64),
+            };
+            (d.family().map(|f| css_family(&f)), size)
+        };
+        let family = family.map(|f| format!("font-family: {f}; ")).unwrap_or_default();
+        self.font_css.load_from_string(&format!("textview.note {{ {family}font-size: {size}; }}"));
+
+        let mono = look.mono_font.map(|m| m.replace(['"', '\''], "")).unwrap_or_default();
+        self.styles.set_mono_font(&format!("{mono},monospace").trim_start_matches(','));
+        let compact = match cfg.headings.as_str() {
+            "compact" => true,
+            "large" => false,
+            _ => look.css_theme.as_deref() == Some("Minimal"),
+        };
+        self.styles.set_headings(compact);
+
+        // List indents are measured in the new font, after the CSS has applied.
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(s) = weak.upgrade() {
+                for t in s.tabs.borrow().iter() {
+                    if let Some(n) = t.note() {
+                        n.restyle();
+                    }
+                }
+            }
+        });
+    }
+
+    fn choose_font(self: &Rc<Self>) {
+        let dialog = gtk::FontDialog::builder().title(tr("Editor font…")).modal(true).build();
+        let current = self.config.borrow().font.clone();
+        let initial = (!current.is_empty()).then(|| gtk::pango::FontDescription::from_string(&current));
+        let weak = Rc::downgrade(self);
+        dialog.choose_font(Some(&self.window), initial.as_ref(), gio::Cancellable::NONE, move |res| {
+            if let (Some(s), Ok(d)) = (weak.upgrade(), res) {
+                s.config.borrow_mut().font = d.to_str().to_string();
+                s.config.borrow().save();
+                s.apply_editor_style();
+            }
+        });
     }
 
     fn toast(&self, msg: &str) {
@@ -832,6 +929,7 @@ impl App {
         self.switching.set(false);
 
         *self.vault.borrow_mut() = Some(dir.clone());
+        self.apply_editor_style();
         self.search_entry.set_text("");
         self.search_results.set(Vec::new(), &dir, "");
         self.tree.set_root(Some(&dir));

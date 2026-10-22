@@ -145,6 +145,7 @@ impl Note {
             if let Some(n) = weak.upgrade() {
                 let w = adj.page_size() as i32;
                 let m = ((w - READABLE_WIDTH) / 2).max(24);
+                n.styles.set_base_margin(m);
                 if n.view.left_margin() != m {
                     n.view.set_left_margin(m);
                     n.view.set_right_margin(m);
@@ -263,6 +264,12 @@ impl Note {
             b.apply_tag(self.styles.tag(span.style), &iter(span.range.start), &iter(span.range.end));
         }
         let conv = |r: &Range<usize>| map.get(r.start)..map.get(r.end);
+        for span in parsed.spans.iter().filter(|s| s.style == markdown::Style::ListMarker) {
+            let (prefix, line) = list_prefix(&text, span.range.end);
+            let width = self.view.create_pango_layout(Some(&text[prefix.clone()])).pixel_size().0;
+            let tag = self.styles.hang_tag(width);
+            b.apply_tag(&tag, &iter(line.start), &iter(line.end));
+        }
         *self.tasks.borrow_mut() = parsed.tasks.iter().map(conv).collect();
         *self.links.borrow_mut() = parsed.links.iter().map(|l| (conv(&l.range), l.target.clone())).collect();
         *self.markers.borrow_mut() = parsed
@@ -397,6 +404,21 @@ impl Drop for Note {
             id.remove();
         }
     }
+}
+
+/// For a list marker ending at `marker_end`: the line's prefix up to the item text (indent,
+/// marker, task box) and the whole line, in bytes.
+fn list_prefix(text: &str, marker_end: usize) -> (Range<usize>, Range<usize>) {
+    let start = text[..marker_end].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[marker_end..].find('\n').map_or(text.len(), |i| marker_end + i);
+    let rest = &text[marker_end..end];
+    let mut skip = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if ["[ ]", "[x]", "[X]"].iter().any(|b| rest[skip..].starts_with(b)) {
+        skip += 3;
+        let r = &rest[skip..];
+        skip += r.len() - r.trim_start_matches([' ', '\t']).len();
+    }
+    (start..marker_end + skip, start..end)
 }
 
 /// Byte offset -> char offset.

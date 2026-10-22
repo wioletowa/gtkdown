@@ -257,13 +257,24 @@ impl Parsed {
                     HeadingLevel::H5 => Style::H5,
                     HeadingLevel::H6 => Style::H6,
                 };
-                self.span(r.clone(), style);
+                let atx = src[r.clone()].trim_start().starts_with('#');
                 match &f.children {
+                    // Setext (`text` over `---`): like Obsidian, only the last text line is the
+                    // heading and the underline stays visible.
+                    Some(c) if !atx => {
+                        let last = src[..c.end].rfind('\n').map_or(r.start, |i| i + 1).max(r.start);
+                        self.span(last..c.end, style);
+                        self.span(c.end..r.end, Style::Syntax);
+                    }
                     Some(c) => {
+                        self.span(r.clone(), style);
                         self.marker_in(Some(src), r.start..c.start, r.clone());
                         self.marker_in(Some(src), c.end..r.end, r.clone());
                     }
-                    None => self.marker_in(Some(src), r.clone(), r.clone()),
+                    None => {
+                        self.span(r.clone(), style);
+                        self.marker_in(Some(src), r.clone(), r.clone());
+                    }
                 }
             }
             Tag::Emphasis | Tag::Strong | Tag::Strikethrough => {
@@ -328,6 +339,9 @@ impl Parsed {
             }
             Tag::BlockQuote(_) => self.quote(src, r),
             Tag::Item => {
+                // Nested items may start at the line's indentation.
+                let ws = src[r.clone()].len() - src[r.clone()].trim_start_matches([' ', '\t']).len();
+                let r = r.start + ws..r.end;
                 let s = &src[r.clone()];
                 let digits = s.bytes().take_while(u8::is_ascii_digit).count();
                 let len = match s.as_bytes() {
@@ -501,6 +515,19 @@ mod tests {
         let src = "## Title\ntext";
         assert_eq!(styles(src, Style::H2), vec!["## Title\n"]);
         assert_eq!(hidden(src), vec!["## "]);
+    }
+
+    #[test]
+    fn nested_list_markers() {
+        let src = "3. **П:**\n    - **Б**: текст\n    - В\n";
+        assert_eq!(styles(src, Style::ListMarker), vec!["-", "-", "3."]);
+    }
+
+    #[test]
+    fn setext_heading() {
+        let src = "long para\na\n---\n";
+        assert_eq!(styles(src, Style::H2), vec!["a"]);
+        assert!(hidden(src).is_empty());
     }
 
     #[test]

@@ -14,6 +14,10 @@ pub struct Session {
 pub struct Config {
     pub theme: String,
     pub lang: String,
+    /// Pango font description; empty means "as the vault's appearance.json says".
+    pub font: String,
+    /// "auto" (compact for the Minimal theme), "large" or "compact".
+    pub headings: String,
     pub width: i32,
     pub height: i32,
     pub maximized: bool,
@@ -28,6 +32,8 @@ impl Default for Config {
         Config {
             theme: "system".into(),
             lang: "auto".into(),
+            font: String::new(),
+            headings: "auto".into(),
             width: 1100,
             height: 720,
             maximized: false,
@@ -66,6 +72,8 @@ impl Config {
             match k {
                 "theme" => c.theme = v.into(),
                 "lang" => c.lang = v.into(),
+                "font" => c.font = v.into(),
+                "headings" => c.headings = v.into(),
                 "width" => c.width = v.parse().unwrap_or(c.width),
                 "height" => c.height = v.parse().unwrap_or(c.height),
                 "maximized" => c.maximized = v == "true",
@@ -89,8 +97,8 @@ impl Config {
 
     pub fn save(&self) {
         let mut s = format!(
-            "theme={}\nlang={}\nwidth={}\nheight={}\nmaximized={}\n",
-            self.theme, self.lang, self.width, self.height, self.maximized
+            "theme={}\nlang={}\nfont={}\nheadings={}\nwidth={}\nheight={}\nmaximized={}\n",
+            self.theme, self.lang, self.font, self.headings, self.width, self.height, self.maximized
         );
         if let Some(v) = &self.last_vault {
             s += &format!("last={}\n", v.display());
@@ -156,6 +164,15 @@ pub fn obsidian_vaults() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// First numeric value for `"key": 12.5`.
+pub fn json_number_for_key(text: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let rest = &text[text.find(&needle)? + needle.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// Minimal scan for `"key": "value"` pairs; enough for obsidian.json without a JSON crate.

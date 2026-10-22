@@ -60,6 +60,12 @@ pub fn tr(en: &'static str) -> &'static str {
         "Quick switcher" => "Быстрый переход",
         "Type a note name…" => "Введите имя заметки…",
         "Create note" => "Создать заметку",
+        "Editor" => "Редактор",
+        "Editor font…" => "Шрифт редактора…",
+        "Use vault font" => "Шрифт из хранилища",
+        "Headings" => "Заголовки",
+        "Large" => "Крупные",
+        "Compact" => "Компактные",
         _ => en,
     }
 }

@@ -3,6 +3,8 @@
 use crate::markdown::Style;
 use adw::prelude::*;
 use gtk::{gdk, pango};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 pub struct Theme {
     pub id: &'static str,
@@ -197,7 +199,6 @@ pub fn by_id(id: &str) -> &'static Theme {
 }
 
 pub const BASE_CSS: &str = "
-textview.note { font-size: 16px; }
 textview.note text { background: none; }
 .note-scroll { background: var(--view-bg-color); }
 .vault-tree row { padding: 0 4px; min-height: 26px; }
@@ -221,7 +222,15 @@ pub struct Styles {
     pub table: gtk::TextTagTable,
     tags: Vec<gtk::TextTag>,
     pub hidden: gtk::TextTag,
+    /// Hanging-indent tags for list items, keyed by marker width in pixels.
+    hang: RefCell<HashMap<i32, gtk::TextTag>>,
+    base_margin: Cell<i32>,
 }
+
+const HEADINGS_LARGE: [f64; 6] = [1.8, 1.6, 1.4, 1.25, 1.12, 1.0];
+/// Close to the Minimal theme.
+const HEADINGS_COMPACT: [f64; 6] = [1.125, 1.05, 1.0, 0.95, 0.9, 0.9];
+const HEADINGS: [Style; 6] = [Style::H1, Style::H2, Style::H3, Style::H4, Style::H5, Style::H6];
 
 impl Styles {
     pub fn new() -> Styles {
@@ -242,7 +251,46 @@ impl Styles {
             .foreground_rgba(&gdk::RGBA::TRANSPARENT)
             .build();
         table.add(&hidden);
-        Styles { table, tags, hidden }
+        let s = Styles { table, tags, hidden, hang: RefCell::default(), base_margin: Cell::new(24) };
+        s.set_headings(false);
+        s
+    }
+
+    pub fn set_headings(&self, compact: bool) {
+        let scales = if compact { HEADINGS_COMPACT } else { HEADINGS_LARGE };
+        for (s, k) in HEADINGS.iter().zip(scales) {
+            self.tag(*s).set_scale(k);
+        }
+    }
+
+    /// `family` may be a comma-separated fallback list.
+    pub fn set_mono_font(&self, family: &str) {
+        for s in [Style::Code, Style::Math, Style::Table, Style::CodeBlock, Style::Frontmatter, Style::Checkbox] {
+            self.tag(s).set_family(Some(family));
+        }
+    }
+
+    /// Tag that wraps continuation lines under the text after a `width`-pixel list marker.
+    pub fn hang_tag(&self, width: i32) -> gtk::TextTag {
+        self.hang
+            .borrow_mut()
+            .entry(width)
+            .or_insert_with(|| {
+                // Negative indent is Pango's hanging indent: wrapped lines shift right by `width`.
+                let t = gtk::TextTag::builder().left_margin(self.base_margin.get()).indent(-width).build();
+                self.table.add(&t);
+                t
+            })
+            .clone()
+    }
+
+    /// Text column margin of the note views; tag margins are absolute so they follow it.
+    pub fn set_base_margin(&self, m: i32) {
+        if self.base_margin.replace(m) != m {
+            for t in self.hang.borrow().values() {
+                t.set_left_margin(m);
+            }
+        }
     }
 
     pub fn tag(&self, s: Style) -> &gtk::TextTag {
@@ -290,19 +338,12 @@ impl Styles {
 }
 
 fn configure(t: &gtk::TextTag, s: Style) {
-    let heading = |scale: f64| {
-        t.set_weight(700);
-        t.set_scale(scale);
-        t.set_pixels_above_lines(6);
-        t.set_pixels_below_lines(4);
-    };
     match s {
-        Style::H1 => heading(1.8),
-        Style::H2 => heading(1.55),
-        Style::H3 => heading(1.35),
-        Style::H4 => heading(1.2),
-        Style::H5 => heading(1.1),
-        Style::H6 => heading(1.0),
+        Style::H1 | Style::H2 | Style::H3 | Style::H4 | Style::H5 | Style::H6 => {
+            t.set_weight(700);
+            t.set_pixels_above_lines(6);
+            t.set_pixels_below_lines(4);
+        }
         Style::Bold | Style::TableHead | Style::CalloutTitle => t.set_weight(700),
         Style::Italic | Style::Embed => t.set_style(pango::Style::Italic),
         Style::Strike => t.set_strikethrough(true),

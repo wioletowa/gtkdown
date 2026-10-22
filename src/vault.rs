@@ -124,6 +124,30 @@ pub fn new_note_dir(root: &Path, current: Option<&Path>) -> PathBuf {
     dir.filter(|d| d.starts_with(root) && d.is_dir()).unwrap_or_else(|| root.to_path_buf())
 }
 
+/// Editor look from `.obsidian/appearance.json`.
+#[derive(Default, Debug)]
+pub struct Appearance {
+    pub text_font: Option<String>,
+    pub mono_font: Option<String>,
+    pub base_size: Option<f64>,
+    pub css_theme: Option<String>,
+}
+
+pub fn appearance(root: &Path) -> Appearance {
+    let Ok(json) = std::fs::read_to_string(root.join(".obsidian/appearance.json")) else {
+        return Appearance::default();
+    };
+    let get = |k: &str| {
+        crate::config::json_strings_for_key(&json, k).into_iter().next().filter(|v| !v.trim().is_empty())
+    };
+    Appearance {
+        text_font: get("textFontFamily"),
+        mono_font: get("monospaceFontFamily"),
+        base_size: crate::config::json_number_for_key(&json, "baseFontSize"),
+        css_theme: get("cssTheme"),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Hit {
     pub path: PathBuf,
