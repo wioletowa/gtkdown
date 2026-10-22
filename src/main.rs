@@ -1,3 +1,4 @@
+mod bookmarks;
 mod config;
 mod fileops;
 mod i18n;

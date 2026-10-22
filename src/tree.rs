@@ -294,6 +294,31 @@ impl Tree {
     }
 }
 
+impl Tree {
+    /// Expands `path` and its parent folders (those that are already loaded).
+    pub fn expand_path(&self, path: &std::path::Path) {
+        let mut set = self.expanded.borrow_mut();
+        for a in path.ancestors() {
+            set.insert(a.to_path_buf());
+        }
+        drop(set);
+        for a in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            self.expand_row(a);
+        }
+    }
+
+    fn expand_row(&self, path: &std::path::Path) {
+        for i in 0..self.selection.n_items() {
+            let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>();
+            if let Some(row) = row
+                && row.item().and_downcast::<gio::FileInfo>().and_then(|i| file_of(&i)?.path()).as_deref() == Some(path)
+            {
+                row.set_expanded(true);
+            }
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 impl Tree {
     pub fn debug_expand(&self, path: &std::path::Path) {

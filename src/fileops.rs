@@ -164,6 +164,8 @@ pub fn move_path(root: &Path, from: &Path, to: &Path) -> io::Result<usize> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::rename(from, to)?;
+    let rel = |p: &Path| slash(p.strip_prefix(root).unwrap_or(p));
+    let _ = crate::bookmarks::rename(root, &rel(from), &rel(to));
     let n = edits.len();
     for (old, text) in edits {
         std::fs::write(map(&old).unwrap_or(old), text)?;

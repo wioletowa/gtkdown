@@ -4,7 +4,8 @@ use crate::config::{Config, Session};
 use crate::i18n::tr;
 use crate::note::{self, Note};
 use crate::theme::{self, Styles};
-use crate::panels::{self, Results};
+use crate::bookmarks;
+use crate::panels::{self, ActionList, Results};
 use crate::fileops;
 use crate::tree::{self, Tree, TreeEvent};
 use crate::vault;
@@ -64,6 +65,10 @@ pub struct App {
     search_entry: gtk::SearchEntry,
     search_results: Rc<Results>,
     backlinks: Rc<Results>,
+    bookmarks: Rc<ActionList>,
+    tags: Rc<ActionList>,
+    outline: Rc<ActionList>,
+    vim_status: gtk::Label,
     /// Bumped per request so stale background results are dropped.
     search_gen: Cell<u64>,
     backlinks_gen: Cell<u64>,
@@ -116,7 +121,7 @@ impl App {
         let side_header = adw::HeaderBar::new();
         side_header.set_show_end_title_buttons(false);
         side_header.set_title_widget(Some(&gtk::Label::new(None)));
-        side_header.pack_end(&new_note);
+
 
         let side_stack = gtk::Stack::new();
         let mut group: Option<gtk::ToggleButton> = None;
@@ -124,6 +129,9 @@ impl App {
         for (name, icon, tip) in [
             ("files", "folder-symbolic", tr("Files")),
             ("search", "system-search-symbolic", tr("Search")),
+            ("bookmarks", "user-bookmarks-symbolic", tr("Bookmarks")),
+            ("tags", "tag-symbolic", tr("Tags")),
+            ("outline", "view-list-symbolic", tr("Outline")),
             ("backlinks", "insert-link-symbolic", tr("Backlinks")),
         ] {
             let b = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).css_classes(["flat"]).build();
@@ -192,6 +200,12 @@ impl App {
 
         let backlinks = Results::new(open_hit(weak.clone()));
         side_stack.add_named(&backlinks.widget, Some("backlinks"));
+        let bookmarks = ActionList::new();
+        side_stack.add_named(&bookmarks.widget, Some("bookmarks"));
+        let tags = ActionList::new();
+        side_stack.add_named(&tags.widget, Some("tags"));
+        let outline = ActionList::new();
+        side_stack.add_named(&outline.widget, Some("outline"));
 
         let vault_button = gtk::MenuButton::builder()
             .direction(gtk::ArrowType::Up)
@@ -213,6 +227,7 @@ impl App {
         let editor_menu = gio::Menu::new();
         editor_menu.append(Some(tr("Editor font…")), Some("win.choose-font"));
         editor_menu.append(Some(tr("Use vault font")), Some("win.reset-font"));
+        editor_menu.append(Some(tr("Vim mode")), Some("win.toggle-vim"));
         let headings_menu = gio::Menu::new();
         headings_menu.append(Some(tr("Automatic")), Some("app.headings::auto"));
         headings_menu.append(Some(tr("Large")), Some("app.headings::large"));
@@ -232,6 +247,8 @@ impl App {
         side_bottom.set_margin_top(4);
         side_bottom.set_margin_bottom(6);
         side_bottom.append(&vault_button);
+        new_note.add_css_class("flat");
+        side_bottom.append(&new_note);
         side_bottom.append(&settings_button);
 
         let sidebar = adw::ToolbarView::new();
@@ -269,6 +286,8 @@ impl App {
         let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         status_bar.set_halign(gtk::Align::End);
         status_bar.add_css_class("statusbar");
+        let vim_status = gtk::Label::builder().margin_end(12).build();
+        status_bar.append(&vim_status);
         status_bar.append(&backlinks_button);
         status_bar.append(&status);
 
@@ -321,6 +340,10 @@ impl App {
             search_entry,
             search_results,
             backlinks,
+            bookmarks,
+            tags,
+            outline,
+            vim_status,
             search_gen: Cell::new(0),
             backlinks_gen: Cell::new(0),
             vault_button,
@@ -386,6 +409,18 @@ impl App {
         path_action("rename", |s, p| s.rename_dialog(&p));
         path_action("delete", |s, p| s.delete_dialog(&p));
         path_action("open-tab", |s, p| s.open_file(p, true));
+        path_action("bookmark", |s, p| s.toggle_bookmark(&p));
+        let remove = gio::SimpleAction::new("bookmark-remove", Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(self);
+        remove.connect_activate(move |_, v| {
+            let (Some(s), Some(v)) = (weak.upgrade(), v.and_then(|v| v.get::<String>())) else { return };
+            let index: Vec<usize> = v.split('/').filter_map(|i| i.parse().ok()).collect();
+            if let Some(root) = s.vault.borrow().clone() {
+                let _ = bookmarks::remove(&root, &index);
+            }
+            s.refresh_bookmarks();
+        });
+        self.window.add_action(&remove);
         win_action("rename-current", |s| {
             if let Some(p) = s.current_tab().and_then(|t| t.path()) {
                 s.rename_dialog(&p);
@@ -402,6 +437,27 @@ impl App {
             s.search_entry.grab_focus();
         });
         win_action("backlinks", |s| s.show_side("backlinks"));
+        win_action("bookmarks", |s| s.show_side("bookmarks"));
+        win_action("tags", |s| s.show_side("tags"));
+        win_action("outline", |s| s.show_side("outline"));
+        win_action("files", |s| s.show_side("files"));
+        win_action("command-palette", |s| s.command_palette());
+        win_action("bookmark-current", |s| {
+            if let Some(p) = s.current_tab().and_then(|t| t.path()) {
+                s.toggle_bookmark(&p);
+            }
+        });
+        win_action("delete-current", |s| {
+            if let Some(p) = s.current_tab().and_then(|t| t.path()) {
+                s.delete_dialog(&p);
+            }
+        });
+        win_action("toggle-vim", |s| {
+            let on = !s.vim_enabled();
+            s.config.borrow_mut().vim = if on { "on" } else { "off" }.into();
+            s.config.borrow().save();
+            s.apply_vim();
+        });
 
         let open_vault = gio::SimpleAction::new("open-vault", Some(glib::VariantTy::STRING));
         let weak = Rc::downgrade(self);
@@ -456,6 +512,7 @@ impl App {
         app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
         app.set_accels_for_action("win.quick-open", &["<Ctrl>o"]);
         app.set_accels_for_action("win.rename-current", &["F2"]);
+        app.set_accels_for_action("win.command-palette", &["<Ctrl>p"]);
         app.set_accels_for_action("win.search", &["<Ctrl><Shift>f"]);
     }
 
@@ -469,10 +526,13 @@ impl App {
         });
         let weak = Rc::downgrade(self);
         self.side_stack.connect_visible_child_name_notify(move |st| {
-            if st.visible_child_name().as_deref() == Some("backlinks")
-                && let Some(s) = weak.upgrade()
-            {
-                s.refresh_backlinks();
+            let Some(s) = weak.upgrade() else { return };
+            match st.visible_child_name().as_deref() {
+                Some("backlinks") => s.refresh_backlinks(),
+                Some("bookmarks") => s.refresh_bookmarks(),
+                Some("tags") => s.refresh_tags(),
+                Some("outline") => s.refresh_outline(),
+                _ => {}
             }
         });
 
@@ -482,6 +542,7 @@ impl App {
                 let tab = s.tab_for(page);
                 if let Some(n) = tab.as_ref().and_then(|t| t.note()) {
                     n.save();
+                    n.set_vim(false);
                 }
                 s.tabs.borrow_mut().retain(|t| &t.page != page);
                 tv.close_page_finish(page, true);
@@ -515,6 +576,11 @@ impl App {
             if let Some(s) = weak.upgrade() {
                 s.save_all();
                 s.store_session();
+                for t in s.tabs.borrow().iter() {
+                    if let Some(n) = t.note() {
+                        n.set_vim(false);
+                    }
+                }
                 let mut c = s.config.borrow_mut();
                 c.maximized = w.is_maximized();
                 if !c.maximized {
@@ -643,6 +709,8 @@ impl App {
     fn set_content(self: &Rc<Self>, tab: &Rc<Tab>, content: Content) {
         if let Some(old) = tab.note() {
             old.save();
+            // The Vim input method must let go before the buffer is destroyed.
+            old.set_vim(false);
         }
         let widget: gtk::Widget = match &content {
             Content::Empty => self.empty_page(),
@@ -675,8 +743,26 @@ impl App {
                     && a.tab_view.selected_page().as_ref() == Some(&t.page)
                 {
                     a.set_status(words, chars);
+                    if a.side_stack.visible_child_name().as_deref() == Some("outline") {
+                        a.refresh_outline();
+                    }
                 }
             }));
+            let (wa, wt) = (Rc::downgrade(self), Rc::downgrade(tab));
+            *n.on_vim_status.borrow_mut() = Some(Box::new(move |text| {
+                if let (Some(a), Some(t)) = (wa.upgrade(), wt.upgrade())
+                    && a.tab_view.selected_page().as_ref() == Some(&t.page)
+                {
+                    a.vim_status.set_label(&text);
+                }
+            }));
+            let (wa, wt) = (Rc::downgrade(self), Rc::downgrade(tab));
+            *n.on_quit.borrow_mut() = Some(Box::new(move || {
+                if let (Some(a), Some(t)) = (wa.upgrade(), wt.upgrade()) {
+                    a.tab_view.close_page(&t.page);
+                }
+            }));
+            n.set_vim(self.vim_enabled());
             let wa = Rc::downgrade(self);
             *n.on_error.borrow_mut() = Some(Box::new(move |msg| {
                 if let Some(a) = wa.upgrade() {
@@ -752,6 +838,10 @@ impl App {
             None => self.status.set_label(""),
         }
         self.refresh_backlinks();
+        self.vim_status.set_label("");
+        if self.side_stack.visible_child_name().as_deref() == Some("outline") {
+            self.refresh_outline();
+        }
         let title = path.and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
         self.window.set_title(Some(&match title {
             Some(t) => format!("{t} — gtkdown"),
@@ -874,6 +964,7 @@ impl App {
                 item(&ops, tr("Open in new tab"), "win.open-tab", p);
             }
             item(&ops, tr("Rename…"), "win.rename", p);
+            item(&ops, tr("Bookmark"), "win.bookmark", p);
             item(&ops, tr("Delete"), "win.delete", p);
             menu.append_section(None, &ops);
         }
@@ -1073,6 +1164,221 @@ impl App {
             a.backlinks_button.set_label(&format!("{}: {files}", tr("Backlinks")));
             a.backlinks_button.set_visible(true);
             a.backlinks.set(hits, &root, tr("No backlinks"));
+        });
+    }
+
+    fn vim_enabled(&self) -> bool {
+        match self.config.borrow().vim.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => self
+                .vault
+                .borrow()
+                .as_deref()
+                .and_then(|v| crate::json::vault_file(v, "app.json"))
+                .and_then(|j| j.get("vimMode").and_then(|b| b.bool()))
+                .unwrap_or(false),
+        }
+    }
+
+    fn apply_vim(&self) {
+        let on = self.vim_enabled();
+        for t in self.tabs.borrow().iter() {
+            if let Some(n) = t.note() {
+                n.set_vim(on);
+            }
+        }
+        self.vim_status.set_label("");
+        self.toast(if on { tr("Vim mode on") } else { tr("Vim mode off") });
+    }
+
+    fn rel(&self, p: &Path) -> Option<String> {
+        let root = self.vault.borrow().clone()?;
+        Some(p.strip_prefix(&root).ok()?.to_string_lossy().into_owned())
+    }
+
+    fn toggle_bookmark(self: &Rc<Self>, path: &Path) {
+        let (Some(root), Some(rel)) = (self.vault.borrow().clone(), self.rel(path)) else { return };
+        let res = match bookmarks::find_file(&root, &rel) {
+            Some(i) => bookmarks::remove(&root, &i).map(|_| tr("Removed from bookmarks")),
+            None => bookmarks::add_file(&root, &rel).map(|_| tr("Added to bookmarks")),
+        };
+        match res {
+            Ok(msg) => self.toast(msg),
+            Err(e) => self.toast(&format!("{}: {e}", tr("Cannot save file"))),
+        }
+        self.refresh_bookmarks();
+    }
+
+    fn refresh_bookmarks(self: &Rc<Self>) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let rows = bookmarks::list(&root)
+            .into_iter()
+            .map(|b| {
+                let heading = matches!(b.kind, bookmarks::Kind::Group);
+                let weak = Rc::downgrade(self);
+                let r = root.clone();
+                let activate: Rc<dyn Fn()> = match b.kind {
+                    bookmarks::Kind::File(p, sub) => Rc::new(move || {
+                        if let Some(a) = weak.upgrade() {
+                            let goto = sub.clone().map_or(Goto::None, Goto::Heading);
+                            a.open_at(r.join(&p), false, goto);
+                        }
+                    }),
+                    bookmarks::Kind::Search(q) => Rc::new(move || {
+                        if let Some(a) = weak.upgrade() {
+                            a.show_side("search");
+                            a.search_entry.set_text(&q);
+                        }
+                    }),
+                    bookmarks::Kind::Folder(p) => Rc::new(move || {
+                        if let Some(a) = weak.upgrade() {
+                            a.show_side("files");
+                            a.tree.expand_path(&r.join(&p));
+                        }
+                    }),
+                    _ => Rc::new(|| {}),
+                };
+                let index = b.index.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+                let weak = Rc::downgrade(self);
+                let menu: Rc<dyn Fn(&gtk::Widget, f64, f64)> = Rc::new(move |w, x, y| {
+                    if let Some(a) = weak.upgrade() {
+                        let m = gio::Menu::new();
+                        let it = gio::MenuItem::new(Some(tr("Remove from bookmarks")), None);
+                        it.set_action_and_target_value(Some("win.bookmark-remove"), Some(&index.to_variant()));
+                        m.append_item(&it);
+                        a.popup_menu(&m, w, x, y);
+                    }
+                });
+                panels::Row { label: b.title, hint: String::new(), indent: b.depth, heading, activate, menu: Some(menu) }
+            })
+            .collect();
+        self.bookmarks.set(rows, tr("No bookmarks"));
+    }
+
+    fn refresh_tags(self: &Rc<Self>) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let r = root.clone();
+            let tags = gio::spawn_blocking(move || vault::all_tags(&vault::list_files(&r))).await.unwrap_or_default();
+            let Some(a) = weak.upgrade() else { return };
+            let rows = tags
+                .into_iter()
+                .map(|(tag, n)| {
+                    let weak = Rc::downgrade(&a);
+                    let q = format!("#{tag}");
+                    panels::Row {
+                        label: q.clone(),
+                        hint: n.to_string(),
+                        indent: 0,
+                        heading: false,
+                        activate: Rc::new(move || {
+                            if let Some(a) = weak.upgrade() {
+                                a.show_side("search");
+                                a.search_entry.set_text(&q);
+                            }
+                        }),
+                        menu: None,
+                    }
+                })
+                .collect();
+            a.tags.set(rows, tr("No tags"));
+        });
+    }
+
+    fn refresh_outline(self: &Rc<Self>) {
+        let Some(n) = self.current_tab().and_then(|t| t.note()) else {
+            self.outline.set(Vec::new(), tr("No headings"));
+            return;
+        };
+        let min = n.headings.borrow().iter().map(|h| h.0).min().unwrap_or(1);
+        let rows = n
+            .headings
+            .borrow()
+            .iter()
+            .map(|(level, text, offset)| {
+                let (wn, off) = (Rc::downgrade(&n), *offset);
+                panels::Row {
+                    label: text.clone(),
+                    hint: String::new(),
+                    indent: (level - min) as usize,
+                    heading: false,
+                    activate: Rc::new(move || {
+                        if let Some(n) = wn.upgrade() {
+                            n.goto(off);
+                        }
+                    }),
+                    menu: None,
+                }
+            })
+            .collect();
+        self.outline.set(rows, tr("No headings"));
+    }
+
+    fn popup_menu(&self, menu: &gio::Menu, widget: &gtk::Widget, x: f64, y: f64) {
+        let pop = gtk::PopoverMenu::from_model(Some(menu));
+        pop.set_parent(widget);
+        pop.set_has_arrow(false);
+        pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        pop.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        pop.popup();
+    }
+
+    /// Ctrl+P: every command with its shortcut.
+    fn command_palette(self: &Rc<Self>) {
+        let mut cmds: Vec<(String, String, Option<String>)> = [
+            ("New note", "win.new-note"),
+            ("New tab", "win.new-tab"),
+            ("Close tab", "win.close-tab"),
+            ("Quick switcher", "win.quick-open"),
+            ("Search in vault…", "win.search"),
+            ("Rename…", "win.rename-current"),
+            ("Delete current note", "win.delete-current"),
+            ("Bookmark current note", "win.bookmark-current"),
+            ("Show files", "win.files"),
+            ("Show bookmarks", "win.bookmarks"),
+            ("Show tags", "win.tags"),
+            ("Show outline", "win.outline"),
+            ("Show backlinks", "win.backlinks"),
+            ("Toggle sidebar", "win.toggle-sidebar"),
+            ("Vim mode", "win.toggle-vim"),
+            ("Editor font…", "win.choose-font"),
+            ("Open folder as vault…", "win.choose-vault"),
+            ("Save", "win.save"),
+        ]
+        .into_iter()
+        .map(|(l, a)| (tr(l).to_string(), a.to_string(), None))
+        .collect();
+        for t in theme::THEMES {
+            cmds.push((format!("{}: {}", tr("Theme"), tr(t.name)), "app.theme".into(), Some(t.id.into())));
+        }
+        let app = self.window.application();
+        let items = cmds
+            .iter()
+            .map(|(label, action, target)| {
+                let detailed = match target {
+                    Some(t) => format!("{action}::{t}"),
+                    None => action.clone(),
+                };
+                let accel = app
+                    .as_ref()
+                    .and_then(|a| a.accels_for_action(&detailed).first().cloned())
+                    .and_then(|a| gtk::accelerator_parse(&a))
+                    .map(|(k, m)| gtk::accelerator_get_label(k, m).to_string())
+                    .unwrap_or_default();
+                (label.clone(), accel)
+            })
+            .collect();
+        let weak = Rc::downgrade(self);
+        panels::picker(&self.window, tr("Command palette"), tr("Type a command…"), items, move |i| {
+            let Some(s) = weak.upgrade() else { return };
+            let (_, action, target) = &cmds[i];
+            let param = target.as_ref().map(|t| t.to_variant());
+            let _ = gtk::prelude::WidgetExt::activate_action(&s.window, action, param.as_ref());
         });
     }
 

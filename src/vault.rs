@@ -134,16 +134,12 @@ pub struct Appearance {
 }
 
 pub fn appearance(root: &Path) -> Appearance {
-    let Ok(json) = std::fs::read_to_string(root.join(".obsidian/appearance.json")) else {
-        return Appearance::default();
-    };
-    let get = |k: &str| {
-        crate::config::json_strings_for_key(&json, k).into_iter().next().filter(|v| !v.trim().is_empty())
-    };
+    let Some(j) = crate::json::vault_file(root, "appearance.json") else { return Appearance::default() };
+    let get = |k: &str| j.get(k).and_then(|v| v.str()).filter(|v| !v.trim().is_empty()).map(String::from);
     Appearance {
         text_font: get("textFontFamily"),
         mono_font: get("monospaceFontFamily"),
-        base_size: crate::config::json_number_for_key(&json, "baseFontSize"),
+        base_size: j.get("baseFontSize").and_then(|v| v.num()),
         css_theme: get("cssTheme"),
     }
 }
@@ -236,6 +232,48 @@ pub fn backlinks(root: &Path, files: &[PathBuf], target: &Path) -> Vec<Hit> {
     out
 }
 
+/// Tags of a note: inline `#tags` and frontmatter `tags:` (inline list, CSV or `- item` lines).
+pub fn note_tags(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = markdown::parse(text)
+        .spans
+        .iter()
+        .filter(|s| s.style == markdown::Style::Tag)
+        .map(|s| text[s.range.clone()].trim_start_matches('#').to_string())
+        .collect();
+    if let Some(fm) = text.strip_prefix("---\n").and_then(|r| r.split("\n---").next()) {
+        let mut in_list = false;
+        for line in fm.lines() {
+            let t = line.trim();
+            if let Some(v) = t.strip_prefix("tags:").or_else(|| t.strip_prefix("tag:")) {
+                let v = v.trim().trim_start_matches('[').trim_end_matches(']');
+                out.extend(v.split([',', ' ']).map(|x| x.trim().trim_matches(['"', '\'', '#'])).filter(|x| !x.is_empty()).map(String::from));
+                in_list = v.is_empty();
+            } else if in_list && let Some(item) = t.strip_prefix("- ") {
+                out.push(item.trim().trim_matches(['"', '\'', '#']).to_string());
+            } else if !line.starts_with([' ', '\t']) {
+                in_list = false;
+            }
+        }
+    }
+    out
+}
+
+/// All tags in the vault with note counts, case-insensitive, sorted by name.
+pub fn all_tags(files: &[PathBuf]) -> Vec<(String, usize)> {
+    let mut map: std::collections::BTreeMap<String, (String, usize)> = Default::default();
+    for f in files.iter().filter(|f| is_note(f)) {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let mut seen = std::collections::HashSet::new();
+        for t in note_tags(&text) {
+            let key = t.to_lowercase();
+            if seen.insert(key.clone()) {
+                map.entry(key).or_insert((t, 0)).1 += 1;
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
 /// Char offset of the heading whose text matches `anchor` (Obsidian compares loosely).
 pub fn heading_offset(text: &str, anchor: &str) -> Option<usize> {
     let norm = |s: &str| s.trim().trim_matches('#').trim().to_lowercase();
@@ -284,6 +322,14 @@ mod tests {
         assert_eq!(bl.len(), 1);
         assert_eq!(bl[0].snippet, "see [[Note]] and [x](b/Note.md)");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tags() {
+        let t = "---\ntags: [arch, \"setup\"]\naliases:\n  - x\n---\nText #Linux/niri #arch\n";
+        assert_eq!(note_tags(t), vec!["Linux/niri", "arch", "arch", "setup"]);
+        let t2 = "---\ntags:\n  - a\n  - b\ntitle: x\n---\n";
+        assert_eq!(note_tags(t2), vec!["a", "b"]);
     }
 
     #[test]

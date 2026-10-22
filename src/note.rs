@@ -43,6 +43,13 @@ pub struct Note {
     title: Option<gtk::Entry>,
     /// New name typed into the inline title (without extension).
     pub on_title: RefCell<Option<Box<dyn Fn(String)>>>,
+    /// (level 1–6, text, char offset) of every heading, refreshed on restyle.
+    pub headings: RefCell<Vec<(u8, String, usize)>>,
+    vim: RefCell<Option<(gtk::EventControllerKey, sourceview5::VimIMContext)>>,
+    /// Vim command line / pending keys, for the status bar.
+    pub on_vim_status: RefCell<Option<Box<dyn Fn(String)>>>,
+    /// `:q` in Vim mode.
+    pub on_quit: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Note {
@@ -103,6 +110,10 @@ impl Note {
             on_link: RefCell::new(None),
             title,
             on_title: RefCell::new(None),
+            headings: RefCell::new(Vec::new()),
+            vim: RefCell::new(None),
+            on_vim_status: RefCell::new(None),
+            on_quit: RefCell::new(None),
         });
         note.sync_title();
         note.load_text(&text);
@@ -327,6 +338,24 @@ impl Note {
             b.apply_tag(self.styles.tag(span.style), &iter(span.range.start), &iter(span.range.end));
         }
         let conv = |r: &Range<usize>| map.get(r.start)..map.get(r.end);
+        *self.headings.borrow_mut() = parsed
+            .spans
+            .iter()
+            .filter_map(|s| {
+                use markdown::Style::*;
+                let level = match s.style {
+                    H1 => 1,
+                    H2 => 2,
+                    H3 => 3,
+                    H4 => 4,
+                    H5 => 5,
+                    H6 => 6,
+                    _ => return None,
+                };
+                let t = text[s.range.clone()].trim().trim_start_matches('#').trim_end_matches('#').trim();
+                Some((level, t.to_string(), map.get(s.range.start)))
+            })
+            .collect();
         for span in parsed.spans.iter().filter(|s| s.style == markdown::Style::ListMarker) {
             let (prefix, line) = list_prefix(&text, span.range.end);
             let width = self.view.create_pango_layout(Some(&text[prefix.clone()])).pixel_size().0;
@@ -413,6 +442,60 @@ impl Note {
         *self.path.borrow_mut() = path;
         self.sync_title();
         self.watch();
+    }
+
+    /// Vim keybindings through GtkSourceView's Vim input method.
+    pub fn set_vim(self: &Rc<Self>, on: bool) {
+        if let Some((keys, im)) = self.vim.take() {
+            im.set_client_widget(None::<&gtk::Widget>);
+            self.view.remove_controller(&keys);
+            self.view.set_overwrite(false);
+        }
+        if !on {
+            return;
+        }
+        let im = sourceview5::VimIMContext::new();
+        let keys = gtk::EventControllerKey::new();
+        keys.set_im_context(Some(&im));
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        self.view.add_controller(keys.clone());
+        im.set_client_widget(Some(&self.view));
+
+        let weak = Rc::downgrade(self);
+        let status = move |im: &sourceview5::VimIMContext| {
+            if let Some(n) = weak.upgrade()
+                && let Some(cb) = &*n.on_vim_status.borrow()
+            {
+                // The typed getters assume non-null strings; these properties start out null.
+                let get = |p: &str| im.property::<Option<String>>(p).unwrap_or_default();
+                let bar = get("command-bar-text");
+                cb(if bar.is_empty() { get("command-text") } else { bar });
+            }
+        };
+        let s = status.clone();
+        im.connect_command_bar_text_notify(move |im| s(im));
+        im.connect_command_text_notify(move |im| status(im));
+        let weak = Rc::downgrade(self);
+        im.connect_write(move |_, _, _| {
+            if let Some(n) = weak.upgrade() {
+                n.save();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        im.connect_execute_command(move |_, cmd| {
+            let Some(n) = weak.upgrade() else { return false };
+            match cmd {
+                ":q" | ":q!" | ":wq" | ":x" => {
+                    n.save();
+                    if let Some(cb) = &*n.on_quit.borrow() {
+                        cb();
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+        *self.vim.borrow_mut() = Some((keys, im));
     }
 
     fn stem(&self) -> String {
