@@ -8,6 +8,8 @@ pub struct Session {
     pub active: usize,
     /// Vault-relative paths of open tabs.
     pub tabs: Vec<String>,
+    /// Vault-relative paths of expanded folders in the tree.
+    pub folders: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +88,17 @@ impl Config {
                             vault: vault.into(),
                             active: active.parse().unwrap_or(0),
                             tabs: it.map(String::from).collect(),
+                            folders: Vec::new(),
                         });
+                    }
+                }
+                "folders" => {
+                    let mut it = v.split('\t');
+                    let vault = PathBuf::from(it.next().unwrap_or_default());
+                    let folders: Vec<String> = it.map(String::from).collect();
+                    match c.sessions.iter_mut().find(|s| s.vault == vault) {
+                        Some(s) => s.folders = folders,
+                        None => c.sessions.push(Session { vault, active: 0, tabs: Vec::new(), folders }),
                     }
                 }
                 _ => {}
@@ -113,6 +125,9 @@ impl Config {
                 s += t;
             }
             s.push('\n');
+            if !ses.folders.is_empty() {
+                s += &format!("folders={}\t{}\n", ses.vault.display(), ses.folders.join("\t"));
+            }
         }
         let p = path();
         if let Some(dir) = p.parent() {

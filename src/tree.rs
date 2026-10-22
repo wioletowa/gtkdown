@@ -3,6 +3,7 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -59,6 +60,8 @@ fn dir_model(dir: &gio::File) -> gio::ListModel {
 pub struct Tree {
     pub view: gtk::ListView,
     selection: gtk::SingleSelection,
+    /// Expanded folders, kept across collapses of their parents and restarts.
+    expanded: Rc<RefCell<BTreeSet<PathBuf>>>,
 }
 
 /// What the user did in the tree.
@@ -220,10 +223,31 @@ impl Tree {
             }
         });
         view.add_controller(drop);
-        Tree { view, selection }
+        Tree { view, selection, expanded: Rc::default() }
     }
 
-    pub fn set_root(&self, dir: Option<&std::path::Path>) {
+    /// Folders to restore: visible rows as they are now, plus remembered ones hidden under a
+    /// collapsed parent. (Row objects are transient, so their signals can't be tracked.)
+    pub fn expanded_paths(&self) -> Vec<PathBuf> {
+        let mut set = self.expanded.borrow().clone();
+        for i in 0..self.selection.n_items() {
+            let Some(row) = self.selection.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+            let Some(path) = row.item().and_downcast::<gio::FileInfo>().and_then(|i| file_of(&i)?.path()) else {
+                continue;
+            };
+            if row.is_expanded() {
+                set.insert(path);
+            } else {
+                set.remove(&path);
+            }
+        }
+        *self.expanded.borrow_mut() = set.clone();
+        set.into_iter().collect()
+    }
+
+    /// Shows `dir`, re-expanding `expanded` folders as their rows load.
+    pub fn set_root(&self, dir: Option<&std::path::Path>, expanded: Vec<PathBuf>) {
+        *self.expanded.borrow_mut() = expanded.into_iter().collect();
         let model = dir.map(|d| {
             let root = dir_model(&gio::File::for_path(d));
             let tree = gtk::TreeListModel::new(root, false, false, |obj| {
@@ -232,6 +256,20 @@ impl Tree {
                     return None;
                 }
                 Some(dir_model(&file_of(info)?))
+            });
+            let set = self.expanded.clone();
+            tree.connect_items_changed(move |m, pos, _, added| {
+                for i in pos..pos + added {
+                    let Some(row) = m.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+                    let Some(path) = row.item().and_downcast::<gio::FileInfo>().and_then(|i| file_of(&i)?.path())
+                    else {
+                        continue;
+                    };
+                    if set.borrow().contains(&path) && !row.is_expanded() {
+                        // Not while the model is emitting items-changed.
+                        glib::idle_add_local_once(move || row.set_expanded(true));
+                    }
+                }
             });
             tree.upcast::<gio::ListModel>()
         });
@@ -253,5 +291,19 @@ impl Tree {
             }
         }
         self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Tree {
+    pub fn debug_expand(&self, path: &std::path::Path) {
+        for i in 0..self.selection.n_items() {
+            let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>();
+            if let Some(row) = row
+                && row.item().and_downcast::<gio::FileInfo>().and_then(|i| file_of(&i)?.path()).as_deref() == Some(path)
+            {
+                row.set_expanded(true);
+            }
+        }
     }
 }

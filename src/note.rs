@@ -13,6 +13,9 @@ use std::time::Duration;
 
 const AUTOSAVE: Duration = Duration::from_millis(1000);
 const READABLE_WIDTH: i32 = 760;
+/// Space above the inline title, and between it and the text.
+const TOP: i32 = 24;
+const GAP: i32 = 16;
 
 pub struct Note {
     pub path: RefCell<PathBuf>,
@@ -36,10 +39,14 @@ pub struct Note {
     pub on_renamed: RefCell<Option<Box<dyn Fn()>>>,
     /// `(target, new_tab)` when a link is clicked.
     pub on_link: RefCell<Option<Box<dyn Fn(String, bool)>>>,
+    /// Obsidian's inline title: the file name as an editable line above the text.
+    title: Option<gtk::Entry>,
+    /// New name typed into the inline title (without extension).
+    pub on_title: RefCell<Option<Box<dyn Fn(String)>>>,
 }
 
 impl Note {
-    pub fn open(path: &Path, styles: Rc<Styles>) -> std::io::Result<Rc<Note>> {
+    pub fn open(path: &Path, styles: Rc<Styles>, inline_title: bool) -> std::io::Result<Rc<Note>> {
         let bytes = std::fs::read(path)?;
         let text = String::from_utf8(bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8"))?;
@@ -69,6 +76,12 @@ impl Note {
             .build();
         widget.add_css_class("note-scroll");
 
+        let title = inline_title.then(|| {
+            let e = gtk::Entry::builder().has_frame(false).css_classes(["inline-title"]).build();
+            view.add_overlay(&e, 24, -60);
+            e
+        });
+
         let note = Rc::new(Note {
             path: RefCell::new(path.to_path_buf()),
             buffer,
@@ -88,7 +101,10 @@ impl Note {
             on_gone: RefCell::new(None),
             on_renamed: RefCell::new(None),
             on_link: RefCell::new(None),
+            title,
+            on_title: RefCell::new(None),
         });
+        note.sync_title();
         note.load_text(&text);
         let start = note.buffer.start_iter();
         note.buffer.place_cursor(&start);
@@ -138,6 +154,46 @@ impl Note {
             }
         });
 
+        if let Some(t) = &self.title {
+            let weak = Rc::downgrade(self);
+            let commit = move || {
+                let Some(n) = weak.upgrade() else { return };
+                let Some(t) = &n.title else { return };
+                let new = t.text().trim().to_string();
+                if new.is_empty() || new == n.stem() {
+                    n.sync_title();
+                } else if let Some(cb) = &*n.on_title.borrow() {
+                    cb(new);
+                }
+            };
+            let c = commit.clone();
+            let weak = Rc::downgrade(self);
+            t.connect_activate(move |_| {
+                c();
+                if let Some(n) = weak.upgrade() {
+                    n.goto(0);
+                }
+            });
+            let focus = gtk::EventControllerFocus::new();
+            focus.connect_leave(move |_| commit());
+            t.add_controller(focus);
+            let keys = gtk::EventControllerKey::new();
+            let weak = Rc::downgrade(self);
+            keys.connect_key_pressed(move |_, key, _, _| {
+                let Some(n) = weak.upgrade() else { return glib::Propagation::Proceed };
+                match key {
+                    gtk::gdk::Key::Escape => {
+                        n.sync_title();
+                        n.goto(0);
+                    }
+                    gtk::gdk::Key::Down => n.goto(0),
+                    _ => return glib::Propagation::Proceed,
+                }
+                glib::Propagation::Stop
+            });
+            t.add_controller(keys);
+        }
+
         // Readable line length: keep the text column centred like Obsidian.
         let weak = Rc::downgrade(self);
         let adj = self.widget.hadjustment();
@@ -150,6 +206,13 @@ impl Note {
                     n.view.set_left_margin(m);
                     n.view.set_right_margin(m);
                 }
+                // Not during size allocation: changing the top margin there trips a GTK assertion.
+                let weak = Rc::downgrade(&n);
+                glib::idle_add_local_once(move || {
+                    if let Some(n) = weak.upgrade() {
+                        n.layout_title(m, w);
+                    }
+                });
             }
         });
 
@@ -348,7 +411,31 @@ impl Note {
     /// After the file was moved by us: follow it without reloading.
     pub fn set_path(self: &Rc<Self>, path: PathBuf) {
         *self.path.borrow_mut() = path;
+        self.sync_title();
         self.watch();
+    }
+
+    fn stem(&self) -> String {
+        self.path.borrow().file_stem().unwrap_or_default().to_string_lossy().into_owned()
+    }
+
+    pub fn sync_title(&self) {
+        if let Some(t) = &self.title {
+            t.set_text(&self.stem());
+        }
+    }
+
+    /// Places the inline title over the text column and makes room for it above the text.
+    fn layout_title(&self, margin: i32, width: i32) {
+        let Some(t) = &self.title else { return };
+        t.set_size_request((width - 2 * margin).max(100), -1);
+        let (_, h, _, _) = t.measure(gtk::Orientation::Vertical, -1);
+        // Overlay y is relative to the first text line, so the title sits in the top margin.
+        self.view.move_overlay(t, margin, -(h + GAP));
+        let top = TOP + h + GAP;
+        if self.view.top_margin() != top {
+            self.view.set_top_margin(top);
+        }
     }
 
     fn watch(self: &Rc<Self>) {
@@ -363,6 +450,7 @@ impl Note {
                 gio::FileMonitorEvent::Renamed => {
                     if let Some(p) = other.and_then(|o| o.path()) {
                         *n.path.borrow_mut() = p;
+                        n.sync_title();
                         n.watch();
                         if let Some(cb) = &*n.on_renamed.borrow() {
                             cb();
@@ -467,6 +555,13 @@ pub fn count_words(text: &str) -> usize {
 
 #[cfg(debug_assertions)]
 impl Note {
+    pub fn debug_title(&self, text: &str) {
+        if let Some(t) = &self.title {
+            t.set_text(text);
+            t.emit_activate();
+        }
+    }
+
     pub fn debug_follow(&self, offset: usize, new_tab: bool) {
         if let (Some(t), Some(cb)) = (self.link_at(offset), &*self.on_link.borrow()) {
             cb(t, new_tab);

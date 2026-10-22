@@ -201,6 +201,8 @@ pub fn by_id(id: &str) -> &'static Theme {
 pub const BASE_CSS: &str = "
 textview.note text { background: none; }
 .note-scroll { background: var(--view-bg-color); }
+textview.note entry.inline-title { font-size: 1.6em; font-weight: 700; background: none; box-shadow: none;
+  outline: none; padding: 0; min-height: 0; }
 .vault-tree row { padding: 0 4px; min-height: 26px; }
 .vault-tree .suffix { font-size: 9px; font-weight: bold; opacity: 0.5; margin-left: 6px; }
 .statusbar { font-size: 12px; opacity: 0.6; padding: 2px 10px; }

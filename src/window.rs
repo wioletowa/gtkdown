@@ -696,6 +696,20 @@ impl App {
                 }
             }));
             let (wa, wn) = (Rc::downgrade(self), Rc::downgrade(&n));
+            *n.on_title.borrow_mut() = Some(Box::new(move |name| {
+                let (Some(a), Some(n)) = (wa.upgrade(), wn.upgrade()) else { return };
+                let from = n.path.borrow().clone();
+                if name.contains('/') || name.starts_with('.') {
+                    a.toast(tr("Invalid name"));
+                    n.sync_title();
+                    return;
+                }
+                let ext = from.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+                let to = from.with_file_name(format!("{name}.{ext}"));
+                a.move_path(&from, &to);
+                n.sync_title();
+            }));
+            let (wa, wn) = (Rc::downgrade(self), Rc::downgrade(&n));
             *n.on_link.borrow_mut() = Some(Box::new(move |target, new_tab| {
                 if let (Some(a), Some(n)) = (wa.upgrade(), wn.upgrade()) {
                     let from = n.path.borrow().clone();
@@ -758,7 +772,14 @@ impl App {
         }
         let ext = tree::ext(&path.to_string_lossy()).unwrap_or_default();
         let content = if ext == "md" {
-            match Note::open(&path, self.styles.clone()) {
+            let show_title = self
+                .vault
+                .borrow()
+                .as_deref()
+                .and_then(|v| crate::json::vault_file(v, "app.json"))
+                .and_then(|j| j.get("showInlineTitle").and_then(|b| b.bool()))
+                .unwrap_or(true);
+            match Note::open(&path, self.styles.clone(), show_title) {
                 Ok(n) => Content::Note(n),
                 Err(e) => {
                     self.toast(&format!("{}: {e}", tr("Cannot open file")));
@@ -1097,7 +1118,13 @@ impl App {
             .and_then(|c| c.path())
             .and_then(|p| tabs.iter().filter_map(|t| t.path()).position(|q| q == p))
             .unwrap_or(0);
-        self.config.borrow_mut().set_session(Session { vault, active, tabs: paths });
+        let folders = self
+            .tree
+            .expanded_paths()
+            .iter()
+            .filter_map(|p| p.strip_prefix(&vault).ok().map(|r| r.to_string_lossy().into_owned()))
+            .collect();
+        self.config.borrow_mut().set_session(Session { vault, active, tabs: paths, folders });
     }
 
     pub fn open_vault(self: &Rc<Self>, dir: PathBuf) {
@@ -1117,7 +1144,13 @@ impl App {
         self.apply_editor_style();
         self.search_entry.set_text("");
         self.search_results.set(Vec::new(), &dir, "");
-        self.tree.set_root(Some(&dir));
+        let folders = self
+            .config
+            .borrow()
+            .session(&dir)
+            .map(|s| s.folders.iter().map(|f| dir.join(f)).collect())
+            .unwrap_or_default();
+        self.tree.set_root(Some(&dir), folders);
         self.config.borrow_mut().remember_vault(&dir);
 
         let session = self.config.borrow().session(&dir).cloned();
@@ -1278,6 +1311,12 @@ impl App {
                 let root = self.vault.borrow().clone().unwrap_or_default();
                 let (a, b) = arg.split_once('>').unwrap_or((arg, arg));
                 self.move_path(&root.join(a), &root.join(b));
+            }
+            "expand" => self.tree.debug_expand(&self.vault.borrow().clone().unwrap_or_default().join(arg)),
+            "title" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.debug_title(arg);
+                }
             }
             "treemenu" => {
                 let root = self.vault.borrow().clone().unwrap_or_default();

@@ -1,6 +1,7 @@
 mod config;
 mod fileops;
 mod i18n;
+mod json;
 mod markdown;
 mod note;
 mod panels;
