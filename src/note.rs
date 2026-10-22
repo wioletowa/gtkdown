@@ -47,6 +47,8 @@ impl Note {
         let buffer = sourceview5::Buffer::new(Some(&styles.table));
         buffer.set_highlight_syntax(false);
         buffer.set_highlight_matching_brackets(false);
+        // No GtkSourceView scheme: colours (background, caret, selection) come from the GTK theme.
+        buffer.set_style_scheme(None::<&sourceview5::StyleScheme>);
         let view = sourceview5::View::with_buffer(&buffer);
         view.add_css_class("note");
         view.set_wrap_mode(gtk::WrapMode::WordChar);
