@@ -2,6 +2,7 @@
 //! Plain std code so it can run on a worker thread.
 
 use crate::markdown;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Every non-hidden file in the vault, recursively.
@@ -66,6 +67,43 @@ pub fn is_external(target: &str) -> bool {
 /// Resolves a link path (no anchor) the way Obsidian does: relative to the linking note, then
 /// from the vault root, then by file name anywhere (same folder first, then shortest path).
 pub fn resolve(root: &Path, files: &[PathBuf], from: &Path, link: &str) -> Option<PathBuf> {
+    resolve_among(root, from, link, |want, want_md| {
+        files
+            .iter()
+            .filter(|f| {
+                let name = f.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                name == want || name == want_md
+            })
+            .collect()
+    })
+}
+
+/// File names (lowercase) to paths, for resolving many links quickly.
+pub struct Names(HashMap<String, Vec<PathBuf>>);
+
+impl Names {
+    pub fn new(files: &[PathBuf]) -> Names {
+        let mut m: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for f in files {
+            m.entry(f.file_name().unwrap_or_default().to_string_lossy().to_lowercase()).or_default().push(f.clone());
+        }
+        Names(m)
+    }
+
+    pub fn resolve(&self, root: &Path, from: &Path, link: &str) -> Option<PathBuf> {
+        resolve_among(root, from, link, |want, want_md| {
+            self.0.get(want).into_iter().chain(self.0.get(want_md)).flatten().collect()
+        })
+    }
+}
+
+/// `candidates(name, name.md)` lists files with a matching name.
+fn resolve_among<'a>(
+    root: &Path,
+    from: &Path,
+    link: &str,
+    candidates: impl FnOnce(&str, &str) -> Vec<&'a PathBuf>,
+) -> Option<PathBuf> {
     if link.is_empty() {
         return Some(from.to_path_buf());
     }
@@ -78,21 +116,17 @@ pub fn resolve(root: &Path, files: &[PathBuf], from: &Path, link: &str) -> Optio
         PathBuf::from(s).canonicalize().ok().filter(|p| p.is_file())
     };
     let base = from.parent().unwrap_or(root);
-    if link.contains('/') || link.starts_with('.') {
-        if let Some(p) = with_md(base.join(link)).or_else(|| with_md(root.join(link.trim_start_matches('/')))) {
-            return Some(p);
-        }
+    if (link.contains('/') || link.starts_with('.'))
+        && let Some(p) = with_md(base.join(link)).or_else(|| with_md(root.join(link.trim_start_matches('/'))))
+    {
+        return Some(p);
     }
 
     let want = link.rsplit('/').next().unwrap_or(link).to_lowercase();
     let want_md = format!("{want}.md");
     let suffix = link.to_lowercase();
     let mut best: Option<&PathBuf> = None;
-    for f in files {
-        let name = f.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        if name != want && name != want_md {
-            continue;
-        }
+    for f in candidates(&want, &want_md) {
         // `Folder/Note` must also match its trailing folders.
         let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy().to_lowercase();
         if link.contains('/') && !rel.trim_end_matches(".md").ends_with(suffix.trim_end_matches(".md")) {
@@ -205,6 +239,7 @@ pub fn search(files: &[PathBuf], query: &str, limit: usize) -> Vec<Hit> {
 
 /// Notes linking to `target`, with the line of each link.
 pub fn backlinks(root: &Path, files: &[PathBuf], target: &Path) -> Vec<Hit> {
+    let names = Names::new(files);
     let mut out = Vec::new();
     for f in files.iter().filter(|f| is_note(f) && f.as_path() != target) {
         let Ok(text) = std::fs::read_to_string(f) else { continue };
@@ -216,7 +251,7 @@ pub fn backlinks(root: &Path, files: &[PathBuf], target: &Path) -> Vec<Hit> {
                 continue;
             }
             let (path, _) = split_target(&l.target);
-            if resolve(root, files, f, &path).as_deref() != Some(target) {
+            if names.resolve(root, f, &path).as_deref() != Some(target) {
                 continue;
             }
             let line_start = text[..l.range.start].rfind('\n').map_or(0, |i| i + 1);

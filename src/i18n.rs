@@ -99,6 +99,8 @@ pub fn tr(en: &'static str) -> &'static str {
         "Show outline" => "Показать оглавление",
         "Show backlinks" => "Показать обратные ссылки",
         "Save" => "Сохранить",
+        "Graph" => "Граф",
+        "Open graph view" => "Открыть граф",
         _ => en,
     }
 }

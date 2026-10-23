@@ -6,6 +6,7 @@ use crate::note::{self, Note};
 use crate::theme::{self, Styles};
 use crate::bookmarks;
 use crate::canvas::Canvas;
+use crate::graph::Graph;
 use crate::panels::{self, ActionList, Results};
 use crate::fileops;
 use crate::tree::{self, Tree, TreeEvent};
@@ -31,6 +32,7 @@ enum Content {
     /// Images: read-only view.
     File(PathBuf),
     Canvas(Rc<Canvas>),
+    Graph(Rc<Graph>),
 }
 
 struct Tab {
@@ -42,7 +44,7 @@ struct Tab {
 impl Tab {
     fn path(&self) -> Option<PathBuf> {
         match &*self.content.borrow() {
-            Content::Empty => None,
+            Content::Empty | Content::Graph(_) => None,
             Content::Note(n) => Some(n.path.borrow().clone()),
             Content::File(p) => Some(p.clone()),
             Content::Canvas(c) => Some(c.path.borrow().clone()),
@@ -254,6 +256,13 @@ impl App {
         side_bottom.set_margin_bottom(6);
         side_bottom.append(&vault_button);
         new_note.add_css_class("flat");
+        let graph_button = gtk::Button::builder()
+            .icon_name("gtkdown-graph-symbolic")
+            .tooltip_text(tr("Graph"))
+            .action_name("win.graph")
+            .css_classes(["flat"])
+            .build();
+        side_bottom.append(&graph_button);
         side_bottom.append(&new_note);
         side_bottom.append(&settings_button);
 
@@ -447,6 +456,7 @@ impl App {
         win_action("tags", |s| s.show_side("tags"));
         win_action("outline", |s| s.show_side("outline"));
         win_action("files", |s| s.show_side("files"));
+        win_action("graph", |s| s.open_graph());
         win_action("command-palette", |s| s.command_palette());
         win_action("bookmark-current", |s| {
             if let Some(p) = s.current_tab().and_then(|t| t.path()) {
@@ -519,6 +529,7 @@ impl App {
         app.set_accels_for_action("win.quick-open", &["<Ctrl>o"]);
         app.set_accels_for_action("win.rename-current", &["F2"]);
         app.set_accels_for_action("win.command-palette", &["<Ctrl>p"]);
+        app.set_accels_for_action("win.graph", &["<Ctrl>g"]);
         app.set_accels_for_action("win.search", &["<Ctrl><Shift>f"]);
     }
 
@@ -729,6 +740,7 @@ impl App {
             Content::Empty => self.empty_page(),
             Content::Note(n) => n.widget.clone().upcast(),
             Content::Canvas(c) => c.widget.clone().upcast(),
+            Content::Graph(g) => g.widget.clone().upcast(),
             Content::File(p) => {
                 let pic = gtk::Picture::for_filename(p);
                 pic.set_content_fit(gtk::ContentFit::ScaleDown);
@@ -820,7 +832,8 @@ impl App {
                 tab.page.set_tooltip(&glib::markup_escape_text(&p.to_string_lossy()));
             }
             None => {
-                tab.page.set_title(tr("New tab"));
+                let graph = matches!(*tab.content.borrow(), Content::Graph(_));
+                tab.page.set_title(tr(if graph { "Graph" } else { "New tab" }));
                 tab.page.set_tooltip("");
             }
         }
@@ -843,6 +856,11 @@ impl App {
             None => self.status.set_label(""),
         }
         self.refresh_backlinks();
+        if let Some(t) = &tab
+            && let Content::Graph(g) = &*t.content.borrow()
+        {
+            g.reload();
+        }
         self.vim_status.set_label("");
         if self.side_stack.visible_child_name().as_deref() == Some("outline") {
             self.refresh_outline();
@@ -1101,7 +1119,7 @@ impl App {
                         Content::Note(n) => n.set_path(new),
                         Content::File(f) => *f = new,
                         Content::Canvas(c) => c.set_path(new),
-                        Content::Empty => {}
+                        Content::Empty | Content::Graph(_) => {}
                     }
                     self.update_tab_title(t);
                 }
@@ -1365,6 +1383,7 @@ impl App {
             ("Show outline", "win.outline"),
             ("Show backlinks", "win.backlinks"),
             ("Toggle sidebar", "win.toggle-sidebar"),
+            ("Open graph view", "win.graph"),
             ("Vim mode", "win.toggle-vim"),
             ("Editor font…", "win.choose-font"),
             ("Open folder as vault…", "win.choose-vault"),
@@ -1400,6 +1419,31 @@ impl App {
             let param = target.as_ref().map(|t| t.to_variant());
             let _ = gtk::prelude::WidgetExt::activate_action(&s.window, action, param.as_ref());
         });
+    }
+
+    /// Graph tab: reuses an open one, else opens a new tab.
+    fn open_graph(self: &Rc<Self>) {
+        let Some(root) = self.vault.borrow().clone() else { return };
+        let existing = self.tabs.borrow().iter().find(|t| matches!(*t.content.borrow(), Content::Graph(_))).cloned();
+        if let Some(t) = existing {
+            self.tab_view.set_selected_page(&t.page);
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let g = Graph::new(&root, move |p, new_tab| {
+            if let Some(a) = weak.upgrade() {
+                // Keep the graph tab: notes open next to it.
+                let on_graph = a.current_tab().is_some_and(|t| matches!(*t.content.borrow(), Content::Graph(_)));
+                a.open_file(p, new_tab || on_graph);
+            }
+        });
+        let tab = match self.current_tab() {
+            Some(t) if matches!(*t.content.borrow(), Content::Empty) => t,
+            _ => self.new_tab(),
+        };
+        self.set_content(&tab, Content::Graph(g.clone()));
+        self.tab_view.set_selected_page(&tab.page);
+        g.widget.grab_focus();
     }
 
     fn show_side(&self, name: &str) {
@@ -1664,6 +1708,19 @@ impl App {
                 );
             }
             "present" => self.window.present(),
+            "graph-hover" | "graph-open" | "graph-zoom" => {
+                let g = self.tabs.borrow().iter().find_map(|t| match &*t.content.borrow() {
+                    Content::Graph(g) => Some(g.clone()),
+                    _ => None,
+                });
+                if let Some(g) = g {
+                    match cmd {
+                        "graph-hover" => g.debug_hover(arg),
+                        "graph-open" => g.debug_open(arg),
+                        _ => g.debug_zoom(arg.parse().unwrap_or(1.0)),
+                    }
+                }
+            }
             "canvas-state" => {
                 if let Some(t) = self.current_tab()
                     && let Content::Canvas(c) = &*t.content.borrow()

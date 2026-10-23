@@ -2,6 +2,7 @@ mod bookmarks;
 mod canvas;
 mod config;
 mod fileops;
+mod graph;
 mod i18n;
 mod json;
 mod markdown;

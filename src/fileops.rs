@@ -2,7 +2,7 @@
 
 use crate::markdown::{self, Link};
 use gtk::gio::prelude::*;
-use crate::vault::{is_external, is_note, list_files, resolve, split_target};
+use crate::vault::{is_external, is_note, list_files, split_target, Names};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -118,6 +118,7 @@ pub fn move_path(root: &Path, from: &Path, to: &Path) -> io::Result<usize> {
     let map = |p: &Path| moved.iter().find(|(o, _)| o == p).map(|(_, n)| n.clone());
     let new_files: Vec<PathBuf> = old_files.iter().map(|f| map(f).unwrap_or_else(|| f.clone())).collect();
     let fmt = link_format(root);
+    let names = Names::new(&old_files);
 
     // Plan against the old layout, so links resolve as they did before the move.
     let mut edits: Vec<(PathBuf, String)> = Vec::new();
@@ -139,7 +140,7 @@ pub fn move_path(root: &Path, from: &Path, to: &Path) -> io::Result<usize> {
             if path.is_empty() {
                 continue;
             }
-            let Some(target) = resolve(root, &old_files, f, &path) else { continue };
+            let Some(target) = names.resolve(root, f, &path) else { continue };
             let target_new = map(&target).unwrap_or_else(|| target.clone());
             // Relative markdown links break when the linking note itself moves.
             let relative_md = !l.wiki && (path.starts_with('.') || path.contains('/'));

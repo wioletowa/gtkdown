@@ -9,6 +9,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_7"] }
 sourceview5 = { version = "0.11", features = ["v5_16"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+pangocairo = "0.22"
 
 [profile.release]
 opt-level = 3
