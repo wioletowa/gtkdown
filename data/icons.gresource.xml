@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/wioletowa/gtkdown/icons">
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-files-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-search-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-bookmarks-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-tags-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-outline-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-backlinks-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-graph-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/gtkdown-new-note-symbolic.svg</file>
+  </gresource>
+</gresources>

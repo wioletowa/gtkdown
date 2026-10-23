@@ -118,7 +118,10 @@ impl App {
             .build();
 
         // Sidebar.
-        let new_note = gtk::Button::from_icon_name("document-new-symbolic");
+        // Our own icons, so the sidebar reads the same in any icon theme.
+        gtk::IconTheme::for_display(&gtk::prelude::WidgetExt::display(&window))
+            .add_resource_path("/io/github/wioletowa/gtkdown/icons");
+        let new_note = gtk::Button::from_icon_name("gtkdown-new-note-symbolic");
         new_note.set_tooltip_text(Some(tr("New note")));
         new_note.set_action_name(Some("win.new-note"));
         let side_header = adw::HeaderBar::new();
@@ -130,12 +133,12 @@ impl App {
         let mut group: Option<gtk::ToggleButton> = None;
         let side_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         for (name, icon, tip) in [
-            ("files", "folder-symbolic", tr("Files")),
-            ("search", "system-search-symbolic", tr("Search")),
-            ("bookmarks", "user-bookmarks-symbolic", tr("Bookmarks")),
-            ("tags", "tag-symbolic", tr("Tags")),
-            ("outline", "view-list-symbolic", tr("Outline")),
-            ("backlinks", "insert-link-symbolic", tr("Backlinks")),
+            ("files", "gtkdown-files-symbolic", tr("Files")),
+            ("search", "gtkdown-search-symbolic", tr("Search")),
+            ("bookmarks", "gtkdown-bookmarks-symbolic", tr("Bookmarks")),
+            ("tags", "gtkdown-tags-symbolic", tr("Tags")),
+            ("outline", "gtkdown-outline-symbolic", tr("Outline")),
+            ("backlinks", "gtkdown-backlinks-symbolic", tr("Backlinks")),
         ] {
             let b = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).css_classes(["flat"]).build();
             b.set_group(group.as_ref());

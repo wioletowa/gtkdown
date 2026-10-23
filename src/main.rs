@@ -20,6 +20,13 @@ use std::rc::Rc;
 const APP_ID: &str = "io.github.wioletowa.gtkdown";
 
 fn main() -> glib::ExitCode {
+    let res = gio::Resource::from_data(&glib::Bytes::from_static(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/icons.gresource"
+    ))))
+    .expect("bundled icons");
+    gio::resources_register(&res);
+
     let config = config::Config::load();
     i18n::init(&config.lang);
 
