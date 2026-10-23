@@ -21,7 +21,9 @@ pub struct Note {
     pub path: RefCell<PathBuf>,
     pub buffer: sourceview5::Buffer,
     pub view: sourceview5::View,
-    pub widget: gtk::ScrolledWindow,
+    /// The tab content: the scrolled editor with the inline title layered over it.
+    pub widget: gtk::Overlay,
+    scroll: gtk::ScrolledWindow,
     styles: Rc<Styles>,
     saved: RefCell<String>,
     loading: Cell<bool>,
@@ -75,17 +77,47 @@ impl Note {
         view.set_auto_indent(true);
         view.set_smart_home_end(sourceview5::SmartHomeEndType::Before);
 
-        let widget = gtk::ScrolledWindow::builder()
+        let scroll = gtk::ScrolledWindow::builder()
             .child(&view)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .hexpand(true)
             .build();
-        widget.add_css_class("note-scroll");
+        scroll.add_css_class("note-scroll");
+        let widget = gtk::Overlay::builder().child(&scroll).build();
 
+        // The title is layered over the scrolled view rather than placed inside the TextView:
+        // a TextView child gets its typing swallowed by the view's input method.
         let title = inline_title.then(|| {
             let e = gtk::Entry::builder().has_frame(false).css_classes(["inline-title"]).build();
-            view.add_overlay(&e, 24, -60);
+            widget.add_overlay(&e);
+            widget.set_clip_overlay(&e, true);
+            let (v, s) = (view.downgrade(), scroll.downgrade());
+            widget.connect_get_child_position(move |_, child| {
+                let (v, s) = (v.upgrade()?, s.upgrade()?);
+                let m = v.left_margin();
+                let w = (s.width() - 2 * m).max(100);
+                let (_, h, _, _) = child.measure(gtk::Orientation::Vertical, w);
+                let y = TOP - s.vadjustment().value() as i32;
+                Some(gtk::gdk::Rectangle::new(m, y, w, h))
+            });
+            let o = widget.downgrade();
+            scroll.vadjustment().connect_value_changed(move |_| {
+                if let Some(o) = o.upgrade() {
+                    o.queue_allocate();
+                }
+            });
+            // Wheel over the title still scrolls the note.
+            let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            let s = scroll.downgrade();
+            wheel.connect_scroll(move |_, _, dy| {
+                if let Some(s) = s.upgrade() {
+                    let a = s.vadjustment();
+                    a.set_value(a.value() + dy * 50.0);
+                }
+                glib::Propagation::Stop
+            });
+            e.add_controller(wheel);
             e
         });
 
@@ -94,6 +126,7 @@ impl Note {
             buffer,
             view,
             widget,
+            scroll,
             styles,
             saved: RefCell::new(String::new()),
             loading: Cell::new(false),
@@ -207,7 +240,7 @@ impl Note {
 
         // Readable line length: keep the text column centred like Obsidian.
         let weak = Rc::downgrade(self);
-        let adj = self.widget.hadjustment();
+        let adj = self.scroll.hadjustment();
         adj.connect_page_size_notify(move |adj| {
             if let Some(n) = weak.upgrade() {
                 let w = adj.page_size() as i32;
@@ -511,10 +544,8 @@ impl Note {
     /// Places the inline title over the text column and makes room for it above the text.
     fn layout_title(&self, margin: i32, width: i32) {
         let Some(t) = &self.title else { return };
-        t.set_size_request((width - 2 * margin).max(100), -1);
-        let (_, h, _, _) = t.measure(gtk::Orientation::Vertical, -1);
-        // Overlay y is relative to the first text line, so the title sits in the top margin.
-        self.view.move_overlay(t, margin, -(h + GAP));
+        let (_, h, _, _) = t.measure(gtk::Orientation::Vertical, (width - 2 * margin).max(100));
+        self.widget.queue_allocate();
         let top = TOP + h + GAP;
         if self.view.top_margin() != top {
             self.view.set_top_margin(top);
@@ -638,6 +669,20 @@ pub fn count_words(text: &str) -> usize {
 
 #[cfg(debug_assertions)]
 impl Note {
+    pub fn debug_focus_title(&self) {
+        if let Some(t) = &self.title {
+            t.grab_focus();
+            t.set_position(-1);
+            eprintln!("TITLE focus={}", t.has_focus());
+        }
+    }
+
+    pub fn debug_print_title(&self) {
+        if let Some(t) = &self.title {
+            eprintln!("TITLE text={:?} focus={} path={:?}", t.text(), t.has_focus(), self.path.borrow().file_name());
+        }
+    }
+
     pub fn debug_title(&self, text: &str) {
         if let Some(t) = &self.title {
             t.set_text(text);

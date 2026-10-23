@@ -624,7 +624,14 @@ impl App {
             (d.family().map(|f| css_family(&f)), size)
         };
         let family = family.map(|f| format!("font-family: {f}; ")).unwrap_or_default();
-        self.font_css.load_from_string(&format!("textview.note {{ {family}font-size: {size}; }}"));
+        // The inline title sits outside the TextView, so it gets the font explicitly.
+        let title_size = match size.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+            Some(i) => format!("{}{}", size[..i].parse::<f64>().unwrap_or(16.0) * 1.6, &size[i..]),
+            None => size.clone(),
+        };
+        self.font_css.load_from_string(&format!(
+            "textview.note {{ {family}font-size: {size}; }}\nentry.inline-title {{ {family}font-size: {title_size}; }}"
+        ));
 
         let mono = look.mono_font.map(|m| m.replace(['"', '\''], "")).unwrap_or_default();
         self.styles.set_mono_font(&format!("{mono},monospace").trim_start_matches(','));
@@ -1624,6 +1631,27 @@ impl App {
                     n.debug_title(arg);
                 }
             }
+            "focus-title" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.debug_focus_title();
+                }
+            }
+            "print-title" => {
+                if let Some(n) = self.current_tab().and_then(|t| t.note()) {
+                    n.debug_print_title();
+                }
+            }
+            "print-focus" => {
+                let f = gtk::prelude::GtkWindowExt::focus(&self.window);
+                eprintln!(
+                    "FOCUS {:?} in_title={} active={}",
+                    f.as_ref().map(|w| w.type_().name()),
+                    f.and_then(|w| w.ancestor(gtk::Entry::static_type())).is_some(),
+                    self.window.is_active()
+                );
+            }
+            "present" => self.window.present(),
+            "print-search" => eprintln!("SEARCH {:?}", self.search_entry.text()),
             "treemenu" => {
                 let root = self.vault.borrow().clone().unwrap_or_default();
                 let p = root.join(arg);
