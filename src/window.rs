@@ -5,6 +5,7 @@ use crate::i18n::tr;
 use crate::note::{self, Note};
 use crate::theme::{self, Styles};
 use crate::bookmarks;
+use crate::canvas::Canvas;
 use crate::panels::{self, ActionList, Results};
 use crate::fileops;
 use crate::tree::{self, Tree, TreeEvent};
@@ -27,8 +28,9 @@ pub enum Goto {
 enum Content {
     Empty,
     Note(Rc<Note>),
-    /// Images and canvases: read-only views.
+    /// Images: read-only view.
     File(PathBuf),
+    Canvas(Rc<Canvas>),
 }
 
 struct Tab {
@@ -43,6 +45,7 @@ impl Tab {
             Content::Empty => None,
             Content::Note(n) => Some(n.path.borrow().clone()),
             Content::File(p) => Some(p.clone()),
+            Content::Canvas(c) => Some(c.path.borrow().clone()),
         }
     }
 
@@ -722,21 +725,13 @@ impl App {
         let widget: gtk::Widget = match &content {
             Content::Empty => self.empty_page(),
             Content::Note(n) => n.widget.clone().upcast(),
+            Content::Canvas(c) => c.widget.clone().upcast(),
             Content::File(p) => {
-                if tree::ext(&p.to_string_lossy()).is_some_and(|e| e == "canvas") {
-                    adw::StatusPage::builder()
-                        .icon_name("view-grid-symbolic")
-                        .title(p.file_stem().unwrap_or_default().to_string_lossy())
-                        .description(tr("Canvas view is coming in a later version"))
-                        .build()
-                        .upcast()
-                } else {
-                    let pic = gtk::Picture::for_filename(p);
-                    pic.set_content_fit(gtk::ContentFit::ScaleDown);
-                    pic.set_margin_top(24);
-                    pic.set_margin_bottom(24);
-                    pic.upcast()
-                }
+                let pic = gtk::Picture::for_filename(p);
+                pic.set_content_fit(gtk::ContentFit::ScaleDown);
+                pic.set_margin_top(24);
+                pic.set_margin_bottom(24);
+                pic.upcast()
             }
         };
         tab.bin.set_child(Some(&widget));
@@ -883,7 +878,21 @@ impl App {
                     return;
                 }
             }
-        } else if ext == "canvas" || IMAGES.contains(&ext.as_str()) {
+        } else if ext == "canvas" {
+            let root = self.vault.borrow().clone().unwrap_or_else(|| path.parent().unwrap_or(&path).to_path_buf());
+            let weak = Rc::downgrade(self);
+            match Canvas::open(&path, &root, move |p| {
+                if let Some(a) = weak.upgrade() {
+                    a.open_file(p, true);
+                }
+            }) {
+                Ok(c) => Content::Canvas(c),
+                Err(e) => {
+                    self.toast(&format!("{}: {e}", tr("Cannot open file")));
+                    return;
+                }
+            }
+        } else if IMAGES.contains(&ext.as_str()) {
             Content::File(path)
         } else {
             gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(
@@ -1088,6 +1097,7 @@ impl App {
                     match &mut *t.content.borrow_mut() {
                         Content::Note(n) => n.set_path(new),
                         Content::File(f) => *f = new,
+                        Content::Canvas(c) => c.set_path(new),
                         Content::Empty => {}
                     }
                     self.update_tab_title(t);
@@ -1651,6 +1661,14 @@ impl App {
                 );
             }
             "present" => self.window.present(),
+            "canvas-state" => {
+                if let Some(t) = self.current_tab()
+                    && let Content::Canvas(c) = &*t.content.borrow()
+                {
+                    eprintln!("CANVAS {}", c.debug_state());
+                    c.widget.grab_focus();
+                }
+            }
             "print-search" => eprintln!("SEARCH {:?}", self.search_entry.text()),
             "treemenu" => {
                 let root = self.vault.borrow().clone().unwrap_or_default();

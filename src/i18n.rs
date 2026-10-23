@@ -45,7 +45,6 @@ pub fn tr(en: &'static str) -> &'static str {
         "Open a folder with notes — an Obsidian vault works as is" => {
             "Откройте папку с заметками — хранилище Obsidian подойдёт как есть"
         }
-        "Canvas view is coming in a later version" => "Просмотр канвасов появится в следующей версии",
         "Cannot open file" => "Не удалось открыть файл",
         "Cannot save file" => "Не удалось сохранить файл",
         "Words" => "Слов",

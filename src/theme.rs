@@ -205,6 +205,12 @@ entry.inline-title { font-weight: 700; background: none; box-shadow: none;
   outline: none; padding: 0; min-height: 0; }
 .vault-tree row { padding: 0 4px; min-height: 26px; }
 .vault-tree .suffix { font-size: 9px; font-weight: bold; opacity: 0.5; margin-left: 6px; }
+.canvas { background: var(--view-bg-color); }
+.canvas-card { background: var(--card-bg-color, alpha(currentColor, 0.05)); border: 2px solid alpha(currentColor, 0.18);
+  border-radius: 8px; padding: 10px 12px; }
+.canvas-group { border: 2px solid alpha(currentColor, 0.18); border-radius: 10px; background: alpha(currentColor, 0.03);
+  padding: 6px 10px; }
+.canvas-edge-label { background: var(--view-bg-color); border-radius: 4px; padding: 0 4px; font-size: 0.9em; }
 .statusbar { font-size: 12px; opacity: 0.6; padding: 2px 10px; }
 ";
 

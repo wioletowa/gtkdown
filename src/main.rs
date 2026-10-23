@@ -1,4 +1,5 @@
 mod bookmarks;
+mod canvas;
 mod config;
 mod fileops;
 mod i18n;
